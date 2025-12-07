@@ -31,6 +31,8 @@ pub const Op = enum(u8) {
     self,
     recv,
     halt,
+    eq,
+    jmp_true,
 };
 
 pub const Instr = struct {
@@ -201,6 +203,20 @@ pub const VM = struct {
                 const payload = proc.regs[instr.b];
                 try vm.sendMessage(proc.id, to_pid, payload);
                 proc.ip += 1;
+            },
+            .eq => {
+                const val_a = proc.regs[instr.a];
+                const val_b = proc.regs[instr.b];
+
+                proc.conditionCode = if (std.meta.eql(val_a, val_b)) 1 else 0;
+                proc.ip += 1;
+            },
+            .jmp_true => {
+                if (proc.conditionCode == 1) {
+                    proc.ip = instr.a;
+                } else {
+                    proc.ip += 1;
+                }
             },
             .recv => {
                 if (proc.mailbox.items.len == 0) {
