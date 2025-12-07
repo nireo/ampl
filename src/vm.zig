@@ -32,7 +32,12 @@ pub const Op = enum(u8) {
     recv,
     halt,
     eq,
+    lt,
+    gt,
+    lteq,
+    gteq,
     jmp_true,
+    jmp_not,
 };
 
 pub const Instr = struct {
@@ -56,16 +61,29 @@ fn debugInstructions(code: []const Instr) void {
 /// MAX_REGS describes the amount of registers that a process should have.
 const MAX_REGS = 256;
 
+/// Number of instructions a process may execute before it is preempted and
+/// returned to the run queue. This is done such that we don't really want to
+/// return a process to the run queue after for example executing one add instruction.
+const REDUCTIONS_PER_SLICE: usize = 100;
+
+/// A process can ultimately be in a just a few states.
+/// - ready to compute something
+/// - waiting for something to happen
+/// - dead i.e. finished
 const ProcessStatus = enum {
     ready,
     waiting,
     dead,
 };
 
+/// Process represents a single 'actor' in the runtime. The actors have their own registers
+/// which the instructions manipulate, this obviously has very basic things such as conditionCode
+/// ip, code, call_stack etc which are very common. Additionally processes have a mailbox, which can
+/// be used to receive information from other processes.
 const Process = struct {
     id: usize,
     regs: [MAX_REGS]Value,
-    conditionCode: u8,
+    cond_code: u8,
     ip: usize,
     code: []const Instr,
     mailbox: std.ArrayList(Message),
@@ -123,7 +141,7 @@ pub const VM = struct {
         var proc = Process{
             .id = pid,
             .regs = undefined,
-            .conditionCode = 0,
+            .cond_code = 0,
             .ip = start_ip,
             .code = code,
             .mailbox = mailbox,
@@ -145,15 +163,22 @@ pub const VM = struct {
         return vm.run_queue.orderedRemove(0);
     }
 
-    /// run loops through the processes executes one instruction in the process, until it's dead.
-    /// only if the process is ready, is it ever added back in the run queue.
+    /// run loops through the processes and gives each ready process a slice of
+    /// reductions (instruction budget) before re-enqueuing it. Waiting processes
+    /// remain parked until a message arrives.
     pub fn run(vm: *VM) !void {
         while (vm.popNext()) |pid| {
             const maybe_proc = &vm.processes.items[pid];
             if (maybe_proc.*) |*proc| {
-                if (proc.status != .ready) continue;
-                try vm.execute(proc);
-                if (proc.status == .ready) {
+                if (proc.status != .ready) continue; // skip waiting/dead
+
+                var reductions: usize = REDUCTIONS_PER_SLICE;
+                while (reductions > 0 and proc.status == .ready) : (reductions -= 1) {
+                    try vm.execute(proc);
+                }
+
+                // only requeue ready processes that exhausted their slice.
+                if (proc.status == .ready and reductions == 0) {
                     try vm.run_queue.append(vm.allocator, pid);
                 }
             }
@@ -208,11 +233,46 @@ pub const VM = struct {
                 const val_a = proc.regs[instr.a];
                 const val_b = proc.regs[instr.b];
 
-                proc.conditionCode = if (std.meta.eql(val_a, val_b)) 1 else 0;
+                proc.cond_code = if (std.meta.eql(val_a, val_b)) 1 else 0;
+                proc.ip += 1;
+            },
+            .lt => {
+                const lhs = try expectInt(proc.regs[instr.a]);
+                const rhs = try expectInt(proc.regs[instr.b]);
+
+                proc.cond_code = if (lhs < rhs) 1 else 0;
+                proc.ip += 1;
+            },
+            .gt => {
+                const lhs = try expectInt(proc.regs[instr.a]);
+                const rhs = try expectInt(proc.regs[instr.b]);
+
+                proc.cond_code = if (lhs > rhs) 1 else 0;
+                proc.ip += 1;
+            },
+            .lteq => {
+                const lhs = try expectInt(proc.regs[instr.a]);
+                const rhs = try expectInt(proc.regs[instr.b]);
+
+                proc.cond_code = if (lhs <= rhs) 1 else 0;
+                proc.ip += 1;
+            },
+            .gteq => {
+                const lhs = try expectInt(proc.regs[instr.a]);
+                const rhs = try expectInt(proc.regs[instr.b]);
+
+                proc.cond_code = if (lhs >= rhs) 1 else 0;
                 proc.ip += 1;
             },
             .jmp_true => {
-                if (proc.conditionCode == 1) {
+                if (proc.cond_code == 1) {
+                    proc.ip = instr.a;
+                } else {
+                    proc.ip += 1;
+                }
+            },
+            .jmp_not => {
+                if (proc.cond_code == 0) {
                     proc.ip = instr.a;
                 } else {
                     proc.ip += 1;
@@ -283,6 +343,14 @@ pub const VM = struct {
             }
         }
     }
+
+    /// readRegister returns the value stored in a register for a given process id.
+    pub fn readRegister(vm: *VM, pid: usize, reg: usize) !Value {
+        if (pid >= vm.processes.items.len) return error.NoSuchPid;
+        const proc = vm.processes.items[pid] orelse return error.NoSuchPid;
+        if (reg >= MAX_REGS) return error.InvalidRegister;
+        return proc.regs[reg];
+    }
 };
 
 fn expectInt(v: Value) !i64 {
@@ -323,6 +391,45 @@ test "arithmetic instructions execute" {
     try std.testing.expect(final.status == .dead);
     try std.testing.expectEqual(@as(i64, 5), try expectInt(final.regs[2]));
     try std.testing.expectEqual(@as(i64, 2), try expectInt(final.regs[3]));
+}
+
+test "condition instructions drive jumps" {
+    const gpa = std.testing.allocator;
+    var vm = try VM.init(gpa);
+    defer vm.deinit();
+
+    const code = [_]Instr{
+        .{ .op = .lt, .a = 0, .b = 1, .c = 0 }, // 1 < 2 -> true
+        .{ .op = .jmp_true, .a = 3, .b = 0, .c = 0 }, // skip imm at 2
+        .{ .op = .imm, .a = 2, .b = 99, .c = 0 }, // should be skipped
+        .{ .op = .gt, .a = 0, .b = 1, .c = 0 }, // 1 > 2 -> false
+        .{ .op = .jmp_not, .a = 6, .b = 0, .c = 0 }, // skip imm at 5
+        .{ .op = .imm, .a = 3, .b = 99, .c = 0 }, // should be skipped
+        .{ .op = .gteq, .a = 1, .b = 0, .c = 0 }, // 2 >= 1 -> true
+        .{ .op = .jmp_true, .a = 9, .b = 0, .c = 0 }, // skip imm at 8
+        .{ .op = .imm, .a = 4, .b = 99, .c = 0 }, // should be skipped
+        .{ .op = .lteq, .a = 0, .b = 0, .c = 0 }, // 1 <= 1 -> true
+        .{ .op = .halt, .a = 0, .b = 0, .c = 0 },
+    };
+
+    const pid = try vm.spawn(&code, 0);
+    var proc = &vm.processes.items[pid].?;
+    proc.regs[0] = Value{ .int = 1 };
+    proc.regs[1] = Value{ .int = 2 };
+    proc.regs[2] = Value{ .int = 0 };
+    proc.regs[3] = Value{ .int = 0 };
+    proc.regs[4] = Value{ .int = 0 };
+
+    try vm.run();
+
+    const final = vm.processes.items[pid].?;
+    try std.testing.expectEqual(@as(ProcessStatus, .dead), final.status);
+    try std.testing.expectEqual(@as(i64, 1), try expectInt(final.regs[0]));
+    try std.testing.expectEqual(@as(i64, 2), try expectInt(final.regs[1]));
+    try std.testing.expectEqual(@as(i64, 0), try expectInt(final.regs[2]));
+    try std.testing.expectEqual(@as(i64, 0), try expectInt(final.regs[3]));
+    try std.testing.expectEqual(@as(i64, 0), try expectInt(final.regs[4]));
+    try std.testing.expectEqual(@as(u8, 1), final.cond_code);
 }
 
 test "call executes function and returns" {

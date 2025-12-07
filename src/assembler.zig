@@ -60,6 +60,12 @@ pub const Assembler = struct {
             .expression => {
                 _ = try self.compileExpr(stmt.expression.expr);
             },
+            .block => {
+                for (stmt.block.stmts) |s| {
+                    try self.compileStatement(s);
+                }
+            },
+            .if_stmt => try self.compileIfStatement(stmt),
             else => return AssembleError.UnsupportedStatement,
         }
     }
@@ -72,6 +78,43 @@ pub const Assembler = struct {
             .binary => try self.compileBinary(expr.binary.left, expr.binary.operator, expr.binary.right),
             else => AssembleError.UnsupportedExpression,
         };
+    }
+
+    fn compileIfStatement(self: *Assembler, stmt: *parser.Statement) AssembleError!void {
+        const ifs = &stmt.if_stmt;
+        const dest = try self.compileExpr(ifs.expr);
+        const zero_reg = try self.loadNumber(0);
+
+        // compare condition register against zero to set the condition code
+        try self.instr.append(self.alloc, .{ .op = .eq, .a = dest, .b = zero_reg, .c = 0 });
+
+        // jump to then branch if condition code is not set (i.e. condition != 0)
+        const jmp_not_idx = self.instr.items.len;
+        try self.instr.append(self.alloc, .{ .op = .jmp_not, .a = 0, .b = 0, .c = 0 });
+
+        if (ifs.else_branch) |else_branch| {
+            try self.compileStatement(else_branch);
+
+            const jmp_end_idx = self.instr.items.len;
+            try self.instr.append(self.alloc, .{ .op = .jmp, .a = 0, .b = 0, .c = 0 });
+
+            const then_start = self.instr.items.len;
+            try self.compileStatement(ifs.then_branch);
+
+            const end_idx = self.instr.items.len;
+            self.instr.items[jmp_not_idx].a = @intCast(then_start);
+            self.instr.items[jmp_end_idx].a = @intCast(end_idx);
+        } else {
+            const skip_then_idx = self.instr.items.len;
+            try self.instr.append(self.alloc, .{ .op = .jmp, .a = 0, .b = 0, .c = 0 });
+
+            const then_start = self.instr.items.len;
+            try self.compileStatement(ifs.then_branch);
+
+            const end_idx = self.instr.items.len;
+            self.instr.items[jmp_not_idx].a = @intCast(then_start);
+            self.instr.items[skip_then_idx].a = @intCast(end_idx);
+        }
     }
 
     fn compileAssign(self: *Assembler, name: []const u8, value: *parser.Expr) AssembleError!u8 {
@@ -130,6 +173,17 @@ pub const Assembler = struct {
         self.next_reg +%= 1;
         return reg;
     }
+
+    /// variables returns the list of variable names that were bound to registers.
+    /// The returned slice is owned by the assembler and becomes invalid after deinit.
+    pub fn variables(self: *const Assembler) []const []const u8 {
+        return self.var_names.items;
+    }
+
+    /// registerFor returns the register index for a variable name when present.
+    pub fn registerFor(self: *const Assembler, name: []const u8) ?u8 {
+        return self.var_regs.get(name);
+    }
 };
 
 const testing = std.testing;
@@ -170,6 +224,72 @@ test "assemble simple addition assignment" {
     const proc = machine.processes.items[pid].?;
     switch (proc.regs[0]) {
         .int => |val| try testing.expectEqual(@as(i64, 5), val),
+        else => try testing.expect(false),
+    }
+}
+
+test "if statement executes then branch" {
+    const src = "a = 0; if (1) { a = 2; } else { a = 3; }";
+    const tokens = try parser.lex(testing.allocator, src);
+    defer testing.allocator.free(tokens);
+
+    var p = try parser.Parser.init(testing.allocator, tokens);
+    defer p.deinit();
+
+    const stmts = try p.parse();
+    defer {
+        for (stmts) |stmt| stmt.deinit(testing.allocator);
+        testing.allocator.free(stmts);
+    }
+
+    var assembler = try Assembler.init(testing.allocator, stmts);
+    defer assembler.deinit();
+
+    const code = try assembler.compile();
+    defer testing.allocator.free(code);
+
+    var machine = try vm.VM.init(testing.allocator);
+    defer machine.deinit();
+
+    const pid = try machine.spawn(code, 0);
+    try machine.run();
+
+    const proc = machine.processes.items[pid].?;
+    switch (proc.regs[0]) {
+        .int => |val| try testing.expectEqual(@as(i64, 2), val),
+        else => try testing.expect(false),
+    }
+}
+
+test "if statement skips then without else" {
+    const src = "a = 0; if (0) { a = 5; }";
+    const tokens = try parser.lex(testing.allocator, src);
+    defer testing.allocator.free(tokens);
+
+    var p = try parser.Parser.init(testing.allocator, tokens);
+    defer p.deinit();
+
+    const stmts = try p.parse();
+    defer {
+        for (stmts) |stmt| stmt.deinit(testing.allocator);
+        testing.allocator.free(stmts);
+    }
+
+    var assembler = try Assembler.init(testing.allocator, stmts);
+    defer assembler.deinit();
+
+    const code = try assembler.compile();
+    defer testing.allocator.free(code);
+
+    var machine = try vm.VM.init(testing.allocator);
+    defer machine.deinit();
+
+    const pid = try machine.spawn(code, 0);
+    try machine.run();
+
+    const proc = machine.processes.items[pid].?;
+    switch (proc.regs[0]) {
+        .int => |val| try testing.expectEqual(@as(i64, 0), val),
         else => try testing.expect(false),
     }
 }
