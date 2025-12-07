@@ -128,6 +128,16 @@ pub fn lex(alloc: std.mem.Allocator, source: []const u8) ![]Token {
                 line += 1;
                 col = 1;
             },
+            '#' => {
+                // this is a comment skip until the end
+                const sl = source[loc..];
+                const end = std.mem.indexOfScalar(u8, sl, '\n') orelse sl.len;
+                loc += end;
+                line += 1;
+                col = 1;
+
+                continue;
+            },
             ' ', '\t' => {
                 col += 1;
             },
@@ -859,4 +869,15 @@ test "if statement parsing correct" {
     const else_ret_value = else_ret.ret.value.?;
     try testing.expect(else_ret_value.* == .number);
     try testing.expect(else_ret_value.number == 0);
+}
+
+test "lex comments" {
+    const content = "# this is a comment\n1";
+    const tokens = try lex(std.testing.allocator, content);
+    defer testing.allocator.free(tokens);
+
+    try testing.expect(tokens.len == 2);
+    try testing.expect(tokens[0].tag == .number);
+    try testing.expect(std.mem.eql(u8, tokens[0].lexeme, "1"));
+    try testing.expect(tokens[1].tag == .eof);
 }
