@@ -12,14 +12,23 @@ pub const Value = union(ValueTag) {
     unit: void,
 };
 
+const Message = struct {
+    sender: usize,
+    payload: Value,
+};
+
 pub const Op = enum(u8) {
     nop,
     mov,
+    imm,
     add,
     sub,
     spawn,
     send,
     jmp,
+    call,
+    ret,
+    self,
     recv,
     halt,
 };
@@ -57,7 +66,8 @@ const Process = struct {
     conditionCode: u8,
     ip: usize,
     code: []const Instr,
-    mailbox: std.ArrayList(Value),
+    mailbox: std.ArrayList(Message),
+    call_stack: std.ArrayList(usize),
     status: ProcessStatus,
 };
 
@@ -81,6 +91,7 @@ pub const VM = struct {
         for (vm.processes.items) |*maybe_proc| {
             if (maybe_proc.*) |*proc| {
                 proc.mailbox.deinit(vm.allocator);
+                proc.call_stack.deinit(vm.allocator);
             }
         }
 
@@ -106,13 +117,15 @@ pub const VM = struct {
         }
 
         // basic process init & run queue append
-        const mailbox = std.ArrayList(Value).empty;
+        const mailbox = std.ArrayList(Message).empty;
         var proc = Process{
             .id = pid,
             .regs = undefined,
+            .conditionCode = 0,
             .ip = start_ip,
             .code = code,
             .mailbox = mailbox,
+            .call_stack = std.ArrayList(usize).empty,
             .status = .ready,
         };
 
@@ -161,6 +174,10 @@ pub const VM = struct {
                 proc.regs[instr.a] = proc.regs[instr.b];
                 proc.ip += 1;
             },
+            .imm => {
+                proc.regs[instr.a] = Value{ .int = instr.b };
+                proc.ip += 1;
+            },
             .add => {
                 const lhs = try expectInt(proc.regs[instr.b]);
                 const rhs = try expectInt(proc.regs[instr.c]);
@@ -182,7 +199,7 @@ pub const VM = struct {
             .send => {
                 const to_pid = try expectPid(proc.regs[instr.a]);
                 const payload = proc.regs[instr.b];
-                try vm.sendMessage(to_pid, payload);
+                try vm.sendMessage(proc.id, to_pid, payload);
                 proc.ip += 1;
             },
             .recv => {
@@ -191,11 +208,39 @@ pub const VM = struct {
                     return;
                 }
                 const msg = proc.mailbox.orderedRemove(0);
-                proc.regs[instr.a] = msg;
+                proc.regs[instr.a] = msg.payload;
+                if (instr.b != instr.a) {
+                    proc.regs[instr.b] = Value{ .pid = msg.sender };
+                }
                 proc.ip += 1;
             },
             .jmp => {
                 proc.ip = instr.a;
+            },
+            .call => {
+                const arg_start = @as(usize, instr.b);
+                const arg_count = @as(usize, instr.c);
+                if (arg_start + arg_count > MAX_REGS) return error.InvalidCallArgs;
+
+                // copy arguments into the callee's argument registers starting at r0
+                var i: usize = 0;
+                while (i < arg_count) : (i += 1) {
+                    proc.regs[i] = proc.regs[arg_start + i];
+                }
+
+                try proc.call_stack.append(vm.allocator, proc.ip + 1);
+                proc.ip = instr.a;
+            },
+            .ret => {
+                if (proc.call_stack.items.len == 0) {
+                    proc.status = .dead;
+                    return;
+                }
+                proc.ip = proc.call_stack.pop() orelse unreachable;
+            },
+            .self => {
+                proc.regs[instr.a] = Value{ .pid = proc.id };
+                proc.ip += 1;
             },
             .halt => {
                 proc.status = .dead;
@@ -204,13 +249,16 @@ pub const VM = struct {
     }
 
     // sendMessage sends a given value into the mailbox of another process.
-    fn sendMessage(vm: *VM, to_pid: usize, msg: Value) !void {
+    fn sendMessage(vm: *VM, from_pid: usize, to_pid: usize, msg: Value) !void {
         if (to_pid >= vm.processes.items.len) return error.NoSuchPid;
         const maybe_proc = &vm.processes.items[to_pid];
         if (maybe_proc.* == null) return error.NoSuchPid;
 
         if (maybe_proc.*) |*proc| {
-            try proc.mailbox.append(vm.allocator, msg);
+            try proc.mailbox.append(vm.allocator, Message{
+                .sender = from_pid,
+                .payload = msg,
+            });
 
             // if it was blocked on RECV, wake it up
             if (proc.status == .waiting) {
@@ -261,6 +309,89 @@ test "arithmetic instructions execute" {
     try std.testing.expectEqual(@as(i64, 2), try expectInt(final.regs[3]));
 }
 
+test "call executes function and returns" {
+    const gpa = std.testing.allocator;
+    var vm = try VM.init(gpa);
+    defer vm.deinit();
+
+    const code = [_]Instr{
+        .{ .op = .call, .a = 2, .b = 0, .c = 0 }, // jump to fn
+        .{ .op = .halt, .a = 0, .b = 0, .c = 0 },
+        .{ .op = .add, .a = 0, .b = 0, .c = 1 }, // fn body: r0 = r0 + r1
+        .{ .op = .ret, .a = 0, .b = 0, .c = 0 },
+    };
+
+    const pid = try vm.spawn(&code, 0);
+    var proc = &vm.processes.items[pid].?;
+    proc.regs[0] = Value{ .int = 2 };
+    proc.regs[1] = Value{ .int = 3 };
+
+    try vm.run();
+
+    const final = vm.processes.items[pid].?;
+    try std.testing.expectEqual(@as(ProcessStatus, .dead), final.status);
+    try std.testing.expectEqual(@as(i64, 5), try expectInt(final.regs[0]));
+    try std.testing.expectEqual(@as(usize, 0), final.call_stack.items.len);
+}
+
+test "call copies parameters into arg registers" {
+    const gpa = std.testing.allocator;
+    var vm = try VM.init(gpa);
+    defer vm.deinit();
+
+    const code = [_]Instr{
+        .{ .op = .call, .a = 3, .b = 2, .c = 2 }, // pass regs2-3 as params
+        .{ .op = .halt, .a = 0, .b = 0, .c = 0 },
+        .{ .op = .nop, .a = 0, .b = 0, .c = 0 }, // padding
+        .{ .op = .add, .a = 4, .b = 0, .c = 1 }, // r4 = r0 + r1 (7+11)
+        .{ .op = .ret, .a = 0, .b = 0, .c = 0 },
+    };
+
+    const pid = try vm.spawn(&code, 0);
+    var proc = &vm.processes.items[pid].?;
+    proc.regs[2] = Value{ .int = 7 };
+    proc.regs[3] = Value{ .int = 11 };
+
+    try vm.run();
+
+    const final = vm.processes.items[pid].?;
+    try std.testing.expectEqual(@as(ProcessStatus, .dead), final.status);
+    try std.testing.expectEqual(@as(i64, 7), try expectInt(final.regs[0]));
+    try std.testing.expectEqual(@as(i64, 11), try expectInt(final.regs[1]));
+    try std.testing.expectEqual(@as(i64, 18), try expectInt(final.regs[4]));
+}
+
+test "nested calls unwind in order" {
+    const gpa = std.testing.allocator;
+    var vm = try VM.init(gpa);
+    defer vm.deinit();
+
+    const code = [_]Instr{
+        .{ .op = .call, .a = 2, .b = 0, .c = 0 }, // main -> outer
+        .{ .op = .halt, .a = 0, .b = 0, .c = 0 },
+        .{ .op = .call, .a = 5, .b = 0, .c = 0 }, // outer -> inner
+        .{ .op = .add, .a = 2, .b = 3, .c = 1 }, // r2 = r3 + r1
+        .{ .op = .ret, .a = 0, .b = 0, .c = 0 }, // return to main
+        .{ .op = .add, .a = 3, .b = 0, .c = 1 }, // inner: r3 = r0 + r1
+        .{ .op = .ret, .a = 0, .b = 0, .c = 0 },
+    };
+
+    const pid = try vm.spawn(&code, 0);
+    var proc = &vm.processes.items[pid].?;
+    proc.regs[0] = Value{ .int = 5 };
+    proc.regs[1] = Value{ .int = 1 };
+    proc.regs[2] = Value{ .int = 0 };
+    proc.regs[3] = Value{ .int = 0 };
+
+    try vm.run();
+
+    const final = vm.processes.items[pid].?;
+    try std.testing.expectEqual(@as(ProcessStatus, .dead), final.status);
+    try std.testing.expectEqual(@as(i64, 6), try expectInt(final.regs[3]));
+    try std.testing.expectEqual(@as(i64, 7), try expectInt(final.regs[2]));
+    try std.testing.expectEqual(@as(usize, 0), final.call_stack.items.len);
+}
+
 test "spawn reuses program and returns child pid" {
     const gpa = std.testing.allocator;
     var vm = try VM.init(gpa);
@@ -309,4 +440,49 @@ test "send wakes waiting receiver" {
     try std.testing.expectEqual(@as(ProcessStatus, .dead), receiver.status);
     try std.testing.expectEqual(@as(i64, 9), try expectInt(receiver.regs[0]));
     try std.testing.expectEqual(@as(ProcessStatus, .dead), vm.processes.items[send_pid].?.status);
+}
+
+test "recv captures sender when requested" {
+    const gpa = std.testing.allocator;
+    var vm = try VM.init(gpa);
+    defer vm.deinit();
+
+    const recv_code = [_]Instr{
+        .{ .op = .recv, .a = 0, .b = 1, .c = 0 },
+        .{ .op = .halt, .a = 0, .b = 0, .c = 0 },
+    };
+    const send_code = [_]Instr{
+        .{ .op = .send, .a = 0, .b = 1, .c = 0 },
+        .{ .op = .halt, .a = 0, .b = 0, .c = 0 },
+    };
+
+    const recv_pid = try vm.spawn(&recv_code, 0);
+    const send_pid = try vm.spawn(&send_code, 0);
+
+    var sender = &vm.processes.items[send_pid].?;
+    sender.regs[0] = Value{ .pid = recv_pid };
+    sender.regs[1] = Value{ .int = 42 };
+
+    try vm.run();
+
+    const receiver = vm.processes.items[recv_pid].?;
+    try std.testing.expectEqual(@as(i64, 42), try expectInt(receiver.regs[0]));
+    try std.testing.expectEqual(send_pid, try expectPid(receiver.regs[1]));
+}
+
+test "self writes current pid" {
+    const gpa = std.testing.allocator;
+    var vm = try VM.init(gpa);
+    defer vm.deinit();
+
+    const code = [_]Instr{
+        .{ .op = .self, .a = 3, .b = 0, .c = 0 },
+        .{ .op = .halt, .a = 0, .b = 0, .c = 0 },
+    };
+
+    const pid = try vm.spawn(&code, 0);
+    try vm.run();
+
+    const proc = vm.processes.items[pid].?;
+    try std.testing.expectEqual(pid, try expectPid(proc.regs[3]));
 }
