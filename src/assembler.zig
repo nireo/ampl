@@ -44,8 +44,10 @@ pub const Assembler = struct {
         }
     }
 
+    /// compile tries to convert all the statements parsed by the parser into a list of instructions for
+    /// the vm. The caller must free the instructions.
     pub fn compile(self: *Assembler) ![]vm.Instr {
-        for (self.statements) |stmt| try self.lowerStatement(stmt);
+        for (self.statements) |stmt| try self.compileStatement(stmt);
         try self.instr.append(self.alloc, .{ .op = .halt, .a = 0, .b = 0, .c = 0 });
 
         const code = try self.instr.toOwnedSlice(self.alloc);
@@ -53,28 +55,28 @@ pub const Assembler = struct {
         return code;
     }
 
-    fn lowerStatement(self: *Assembler, stmt: *parser.Statement) AssembleError!void {
+    fn compileStatement(self: *Assembler, stmt: *parser.Statement) AssembleError!void {
         switch (stmt.*) {
             .expression => {
-                _ = try self.lowerExpr(stmt.expression.expr);
+                _ = try self.compileExpr(stmt.expression.expr);
             },
             else => return AssembleError.UnsupportedStatement,
         }
     }
 
-    fn lowerExpr(self: *Assembler, expr: *parser.Expr) AssembleError!u8 {
+    fn compileExpr(self: *Assembler, expr: *parser.Expr) AssembleError!u8 {
         return switch (expr.*) {
             .number => try self.loadNumber(expr.number),
             .identifier => try self.lookupRegister(expr.identifier),
-            .assign => try self.lowerAssign(expr.assign.name, expr.assign.value),
-            .binary => try self.lowerBinary(expr.binary.left, expr.binary.operator, expr.binary.right),
+            .assign => try self.compileAssign(expr.assign.name, expr.assign.value),
+            .binary => try self.compileBinary(expr.binary.left, expr.binary.operator, expr.binary.right),
             else => AssembleError.UnsupportedExpression,
         };
     }
 
-    fn lowerAssign(self: *Assembler, name: []const u8, value: *parser.Expr) AssembleError!u8 {
+    fn compileAssign(self: *Assembler, name: []const u8, value: *parser.Expr) AssembleError!u8 {
         const dest = try self.getOrCreateRegister(name);
-        const value_reg = try self.lowerExpr(value);
+        const value_reg = try self.compileExpr(value);
 
         if (value_reg != dest) {
             try self.instr.append(self.alloc, .{ .op = .mov, .a = dest, .b = value_reg, .c = 0 });
@@ -83,9 +85,9 @@ pub const Assembler = struct {
         return dest;
     }
 
-    fn lowerBinary(self: *Assembler, left: *parser.Expr, operator: parser.TokenTag, right: *parser.Expr) AssembleError!u8 {
-        const lhs_reg = try self.lowerExpr(left);
-        const rhs_reg = try self.lowerExpr(right);
+    fn compileBinary(self: *Assembler, left: *parser.Expr, operator: parser.TokenTag, right: *parser.Expr) AssembleError!u8 {
+        const lhs_reg = try self.compileExpr(left);
+        const rhs_reg = try self.compileExpr(right);
         const out = try self.allocateRegister();
 
         const op = switch (operator) {

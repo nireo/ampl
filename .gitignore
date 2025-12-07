@@ -1,5 +1,6 @@
 .zig-cache/
 .zig-cache-global/
+zig-cache/
 zig-out/
 /release/
 /debug/

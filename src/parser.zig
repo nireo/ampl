@@ -20,10 +20,15 @@ pub const TokenTag = enum {
     keyword_spawn,
     keyword_loop,
     keyword_def,
+    keyword_if,
+    keyword_ret,
+    keyword_else,
     l_brace,
     r_brace,
     l_paren,
     r_paren,
+    lt,
+    gt,
     comma,
     colon,
     semicolon,
@@ -33,7 +38,6 @@ pub const TokenTag = enum {
     plus,
     minus,
     slash,
-    ret,
     eof,
 
     fn precedence(self: TokenTag) !usize {
@@ -42,6 +46,8 @@ pub const TokenTag = enum {
             .slash => 50,
             .plus => 45,
             .minus => 45,
+            .gt => 35,
+            .lt => 35,
             .equal => 1,
             else => ParserError.PrecendenceError,
         };
@@ -60,7 +66,9 @@ const keywords = std.StaticStringMap(TokenTag).initComptime(.{
     .{ "def", TokenTag.keyword_def },
     .{ "spawn", TokenTag.keyword_spawn },
     .{ "loop", TokenTag.keyword_loop },
-    .{ "ret", TokenTag.ret },
+    .{ "ret", TokenTag.keyword_ret },
+    .{ "if", TokenTag.keyword_if },
+    .{ "else", TokenTag.keyword_else },
 });
 
 pub fn lex(alloc: std.mem.Allocator, source: []const u8) ![]Token {
@@ -175,6 +183,14 @@ pub fn lex(alloc: std.mem.Allocator, source: []const u8) ![]Token {
                 tag = .plus;
                 col += 1;
             },
+            '>' => {
+                tag = .gt;
+                col += 1;
+            },
+            '<' => {
+                tag = .lt;
+                col += 1;
+            },
             else => {
                 return LexerError.UnrecognizedChar;
             },
@@ -208,6 +224,7 @@ pub const StatementTag = enum {
     fn_def,
     var_def,
     ret,
+    if_stmt,
 };
 
 pub const ExprTag = enum {
@@ -279,6 +296,11 @@ pub const Statement = union(StatementTag) {
     ret: struct {
         value: ?*Expr,
     },
+    if_stmt: struct {
+        expr: *Expr,
+        then_branch: *Statement,
+        else_branch: ?*Statement,
+    },
 
     pub fn deinit(self: *Statement, alloc: std.mem.Allocator) void {
         switch (self.*) {
@@ -303,6 +325,14 @@ pub const Statement = union(StatementTag) {
             .ret => {
                 if (self.ret.value) |val| {
                     val.deinit(alloc);
+                }
+            },
+            .if_stmt => {
+                self.if_stmt.expr.deinit(alloc);
+                self.if_stmt.then_branch.deinit(alloc);
+
+                if (self.if_stmt.else_branch) |eb| {
+                    eb.deinit(alloc);
                 }
             },
         }
@@ -433,16 +463,50 @@ pub const Parser = struct {
         }
     }
 
+    fn parseIf(self: *Parser) ParseError!*Statement {
+        try self.expect(.keyword_if);
+        try self.expect(.l_paren);
+
+        const cond = try self.parseExpression(0);
+        errdefer cond.deinit(self.alloc);
+
+        try self.expect(.r_paren);
+
+        const then_branch = try self.parseStatement();
+        errdefer then_branch.deinit(self.alloc);
+
+        const stmt = try self.alloc.create(Statement);
+        errdefer stmt.deinit(self.alloc);
+
+        stmt.* = .{ .if_stmt = .{
+            .expr = cond,
+            .then_branch = then_branch,
+            .else_branch = null,
+        } };
+
+        if (self.match(.keyword_else)) {
+            const else_branch = try self.parseStatement();
+            errdefer else_branch.deinit(self.alloc);
+
+            stmt.*.if_stmt.else_branch = else_branch;
+        }
+
+        return stmt;
+    }
+
     fn parseStatement(self: *Parser) ParseError!*Statement {
         switch (self.peek().tag) {
             .keyword_def => {
                 _ = self.advance();
                 return try self.parseDef();
             },
+            .keyword_if => {
+                return try self.parseIf();
+            },
             .l_brace => {
                 return try self.parseBlock();
             },
-            .ret => {
+            .keyword_ret => {
                 _ = self.advance(); // skip ret
                 var value: ?*Expr = null;
                 if (self.peek().tag != .semicolon) { // if next token is not semicolon parse expr
@@ -744,4 +808,55 @@ test "function call expression parsing" {
 
     try testing.expect(call_expr.function_call.args[0].*.number == 1);
     try testing.expect(std.mem.eql(u8, call_expr.function_call.args[1].identifier, "two"));
+}
+
+test "if statement parsing correct" {
+    const content = "if (x > 0) { ret x; } else { ret 0; }";
+    const tokens = try lex(std.testing.allocator, content);
+    defer testing.allocator.free(tokens);
+
+    var parser = try Parser.init(std.testing.allocator, tokens);
+    defer parser.deinit();
+
+    const stmts = try parser.parse();
+    defer {
+        for (stmts) |stmt| {
+            stmt.deinit(std.testing.allocator);
+        }
+        std.testing.allocator.free(stmts);
+    }
+
+    try testing.expectEqual(@as(usize, 1), stmts.len);
+    const if_stmt = stmts[0];
+    try testing.expect(if_stmt.* == .if_stmt);
+
+    const if_data = if_stmt.if_stmt;
+    const cond_expr = if_data.expr;
+    try testing.expect(cond_expr.* == .binary);
+    try testing.expect(cond_expr.binary.operator == .gt);
+
+    const then_branch = if_data.then_branch;
+    try testing.expect(then_branch.* == .block);
+    try testing.expectEqual(@as(usize, 1), then_branch.block.stmts.len);
+
+    const then_ret = then_branch.block.stmts[0];
+    try testing.expect(then_ret.* == .ret);
+    try testing.expect(then_ret.ret.value != null);
+
+    const then_ret_value = then_ret.ret.value.?;
+    try testing.expect(then_ret_value.* == .identifier);
+    try testing.expect(std.mem.eql(u8, then_ret_value.identifier, "x"));
+    try testing.expect(if_data.else_branch != null);
+
+    const else_branch = if_data.else_branch.?;
+    try testing.expect(else_branch.* == .block);
+    try testing.expectEqual(@as(usize, 1), else_branch.block.stmts.len);
+
+    const else_ret = else_branch.block.stmts[0];
+    try testing.expect(else_ret.* == .ret);
+    try testing.expect(else_ret.ret.value != null);
+
+    const else_ret_value = else_ret.ret.value.?;
+    try testing.expect(else_ret_value.* == .number);
+    try testing.expect(else_ret_value.number == 0);
 }
