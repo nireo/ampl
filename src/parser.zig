@@ -4,16 +4,16 @@ const LexerError = error{
     UnrecognizedChar,
 };
 
-const ParserError = error{
+pub const ParserError = error{
     InvalidTokenStmt,
     InvalidExpression,
     ExpectedToken,
     PrecendenceError,
 };
 
-const ParseError = ParserError || std.mem.Allocator.Error;
+pub const ParseError = ParserError || std.mem.Allocator.Error;
 
-const TokenTag = enum {
+pub const TokenTag = enum {
     identifier,
     number,
     keyword_let,
@@ -48,7 +48,7 @@ const TokenTag = enum {
     }
 };
 
-const Token = struct {
+pub const Token = struct {
     tag: TokenTag,
     lexeme: []const u8,
     line: usize,
@@ -202,7 +202,7 @@ pub fn lex(alloc: std.mem.Allocator, source: []const u8) ![]Token {
     return tokens.toOwnedSlice(alloc);
 }
 
-const StatementTag = enum {
+pub const StatementTag = enum {
     expression,
     block,
     fn_def,
@@ -210,7 +210,7 @@ const StatementTag = enum {
     ret,
 };
 
-const ExprTag = enum {
+pub const ExprTag = enum {
     number,
     identifier,
     binary,
@@ -218,7 +218,7 @@ const ExprTag = enum {
     function_call,
 };
 
-const Expr = union(ExprTag) {
+pub const Expr = union(ExprTag) {
     number: i64,
     identifier: []const u8,
     binary: struct {
@@ -248,6 +248,7 @@ const Expr = union(ExprTag) {
                 for (self.function_call.args) |arg| {
                     arg.deinit(alloc);
                 }
+                alloc.free(self.function_call.args);
             },
             else => {},
         }
@@ -259,7 +260,7 @@ const Param = struct {
     name: []const u8,
 };
 
-const Statement = union(StatementTag) {
+pub const Statement = union(StatementTag) {
     expression: struct {
         expr: *Expr,
     },
@@ -309,12 +310,12 @@ const Statement = union(StatementTag) {
     }
 };
 
-const Parser = struct {
+pub const Parser = struct {
     tokens: []const Token,
     index: usize,
     alloc: std.mem.Allocator,
 
-    fn init(alloc: std.mem.Allocator, tokens: []const Token) !Parser {
+    pub fn init(alloc: std.mem.Allocator, tokens: []const Token) !Parser {
         return Parser{
             .alloc = alloc,
             .tokens = tokens,
@@ -322,7 +323,7 @@ const Parser = struct {
         };
     }
 
-    fn deinit(self: *Parser) void {
+    pub fn deinit(self: *Parser) void {
         _ = self; // parser currently borrows tokens; caller frees them
     }
 
@@ -386,11 +387,45 @@ const Parser = struct {
             },
             .identifier => {
                 _ = self.advance();
-                const expr = try self.alloc.create(Expr);
-                expr.* = .{
-                    .identifier = tok.lexeme,
-                };
-                return expr;
+                if (self.peek().tag == .l_paren) {
+                    _ = self.advance(); // consume '('
+                    var args = try std.ArrayList(*Expr).initCapacity(self.alloc, 0);
+                    defer args.deinit(self.alloc);
+
+                    while (self.peek().tag != .r_paren) {
+                        const arg = try self.parseExpression(0);
+                        try args.append(self.alloc, arg);
+
+                        if (self.peek().tag == .comma) {
+                            _ = self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+
+                    try self.expect(.r_paren);
+
+                    const expr = try self.alloc.create(Expr);
+                    expr.* = .{
+                        .function_call = .{
+                            .name = tok.lexeme,
+                            .args = try args.toOwnedSlice(self.alloc),
+                        },
+                    };
+                    return expr;
+                } else {
+                    const expr = try self.alloc.create(Expr);
+                    expr.* = .{
+                        .identifier = tok.lexeme,
+                    };
+                    return expr;
+                }
+            },
+            .l_paren => {
+                _ = self.advance(); // consume '('
+                const inner = try self.parseExpression(0);
+                try self.expect(.r_paren);
+                return inner;
             },
             else => {
                 return ParseError.InvalidTokenStmt;
@@ -676,4 +711,37 @@ test "function definition parsing" {
     const right_expr = bin_expr.right;
     try testing.expect(right_expr.* == .identifier);
     try testing.expect(std.mem.eql(u8, right_expr.identifier, "b"));
+}
+
+test "function call expression parsing" {
+    const content = "result = add(1, two);";
+    const tokens = try lex(std.testing.allocator, content);
+    defer testing.allocator.free(tokens);
+
+    var parser = try Parser.init(std.testing.allocator, tokens);
+    defer parser.deinit();
+
+    const stmts = try parser.parse();
+    defer {
+        for (stmts) |stmt| {
+            stmt.deinit(std.testing.allocator);
+        }
+        std.testing.allocator.free(stmts);
+    }
+
+    try testing.expectEqual(@as(usize, 1), stmts.len);
+    const expr_stmt = stmts[0];
+    try testing.expect(expr_stmt.* == .expression);
+
+    const assign_expr = expr_stmt.expression.expr;
+    try testing.expect(assign_expr.* == .assign);
+    try testing.expect(std.mem.eql(u8, assign_expr.assign.name, "result"));
+
+    const call_expr = assign_expr.assign.value;
+    try testing.expect(call_expr.* == .function_call);
+    try testing.expect(std.mem.eql(u8, call_expr.function_call.name, "add"));
+    try testing.expectEqual(@as(usize, 2), call_expr.function_call.args.len);
+
+    try testing.expect(call_expr.function_call.args[0].*.number == 1);
+    try testing.expect(std.mem.eql(u8, call_expr.function_call.args[1].identifier, "two"));
 }
