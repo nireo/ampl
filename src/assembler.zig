@@ -66,6 +66,7 @@ pub const Assembler = struct {
                 }
             },
             .if_stmt => try self.compileIfStatement(stmt),
+            .loop => try self.compileLoop(stmt),
             else => return AssembleError.UnsupportedStatement,
         }
     }
@@ -78,6 +79,35 @@ pub const Assembler = struct {
             .binary => try self.compileBinary(expr.binary.left, expr.binary.operator, expr.binary.right),
             else => AssembleError.UnsupportedExpression,
         };
+    }
+
+    fn compileLoop(self: *Assembler, stmt: *parser.Statement) AssembleError!void {
+        const lo = &stmt.loop;
+        if (lo.cond) |c| {
+            const loop_start = self.instr.items.len;
+            const dest = try self.compileExpr(c);
+            const zero_reg = try self.loadNumber(0);
+
+            // update the condition code
+            try self.instr.append(self.alloc, .{ .op = .eq, .a = dest, .b = zero_reg, .c = 0 });
+
+            // if condition is false then jump past the loop. the end of loop is updated later.
+            const jmp_false_idx = self.instr.items.len;
+            try self.instr.append(self.alloc, .{ .op = .jmp_true, .a = 0, .b = 0, .c = 0 });
+
+            try self.compileStatement(lo.body);
+
+            // go back to start
+            try self.instr.append(self.alloc, .{ .op = .jmp, .a = @intCast(loop_start), .b = 0, .c = 0 });
+
+            // jump past the loop if the condition is false
+            self.instr.items[jmp_false_idx].a = @intCast(self.instr.items.len);
+        } else {
+            const loop_start_idx = self.instr.items.len;
+            try self.compileStatement(lo.body);
+
+            try self.instr.append(self.alloc, .{ .op = .jmp, .a = @intCast(loop_start_idx), .b = 0, .c = 0 });
+        }
     }
 
     fn compileIfStatement(self: *Assembler, stmt: *parser.Statement) AssembleError!void {
@@ -136,6 +166,7 @@ pub const Assembler = struct {
         const op = switch (operator) {
             .plus => vm.Op.add,
             .minus => vm.Op.sub,
+            .lt => vm.Op.lt,
             else => return AssembleError.UnsupportedOperator,
         };
 
@@ -290,6 +321,39 @@ test "if statement skips then without else" {
     const proc = machine.processes.items[pid].?;
     switch (proc.regs[0]) {
         .int => |val| try testing.expectEqual(@as(i64, 0), val),
+        else => try testing.expect(false),
+    }
+}
+
+test "loop condition drives execution" {
+    const src = "a = 1; loop (a < 3) { a = a + 1; }";
+    const tokens = try parser.lex(testing.allocator, src);
+    defer testing.allocator.free(tokens);
+
+    var p = try parser.Parser.init(testing.allocator, tokens);
+    defer p.deinit();
+
+    const stmts = try p.parse();
+    defer {
+        for (stmts) |stmt| stmt.deinit(testing.allocator);
+        testing.allocator.free(stmts);
+    }
+
+    var assembler = try Assembler.init(testing.allocator, stmts);
+    defer assembler.deinit();
+
+    const code = try assembler.compile();
+    defer testing.allocator.free(code);
+
+    var machine = try vm.VM.init(testing.allocator);
+    defer machine.deinit();
+
+    const pid = try machine.spawn(code, 0);
+    try machine.run();
+
+    const proc = machine.processes.items[pid].?;
+    switch (proc.regs[0]) {
+        .int => |val| try testing.expectEqual(@as(i64, 3), val),
         else => try testing.expect(false),
     }
 }

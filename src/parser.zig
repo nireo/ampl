@@ -235,6 +235,7 @@ pub const StatementTag = enum {
     var_def,
     ret,
     if_stmt,
+    loop,
 };
 
 pub const ExprTag = enum {
@@ -311,6 +312,10 @@ pub const Statement = union(StatementTag) {
         then_branch: *Statement,
         else_branch: ?*Statement,
     },
+    loop: struct {
+        cond: ?*Expr,
+        body: *Statement,
+    },
 
     pub fn deinit(self: *Statement, alloc: std.mem.Allocator) void {
         switch (self.*) {
@@ -344,6 +349,12 @@ pub const Statement = union(StatementTag) {
                 if (self.if_stmt.else_branch) |eb| {
                     eb.deinit(alloc);
                 }
+            },
+            .loop => {
+                if (self.loop.cond) |c| {
+                    c.deinit(alloc);
+                }
+                self.loop.body.deinit(alloc);
             },
         }
         alloc.destroy(self);
@@ -473,6 +484,28 @@ pub const Parser = struct {
         }
     }
 
+    fn parseLoop(self: *Parser) ParseError!*Statement {
+        try self.expect(.keyword_loop);
+
+        var cond: ?*Expr = null;
+        if (self.match(.l_paren)) {
+            cond = try self.parseExpression(0);
+            try self.expect(.r_paren);
+        }
+
+        const body = try self.parseStatement();
+
+        const stmt = try self.alloc.create(Statement);
+        errdefer stmt.deinit(self.alloc);
+
+        stmt.* = .{ .loop = .{
+            .cond = cond,
+            .body = body,
+        } };
+
+        return stmt;
+    }
+
     fn parseIf(self: *Parser) ParseError!*Statement {
         try self.expect(.keyword_if);
         try self.expect(.l_paren);
@@ -515,6 +548,9 @@ pub const Parser = struct {
             },
             .l_brace => {
                 return try self.parseBlock();
+            },
+            .keyword_loop => {
+                return try self.parseLoop();
             },
             .keyword_ret => {
                 _ = self.advance(); // skip ret
@@ -880,4 +916,63 @@ test "lex comments" {
     try testing.expect(tokens[0].tag == .number);
     try testing.expect(std.mem.eql(u8, tokens[0].lexeme, "1"));
     try testing.expect(tokens[1].tag == .eof);
+}
+
+test "loop without condition" {
+    const content = "loop { 1+1; }";
+    const tokens = try lex(std.testing.allocator, content);
+    defer testing.allocator.free(tokens);
+
+    var parser = try Parser.init(std.testing.allocator, tokens);
+    defer parser.deinit();
+
+    const stmts = try parser.parse();
+    defer {
+        for (stmts) |stmt| {
+            stmt.deinit(std.testing.allocator);
+        }
+        std.testing.allocator.free(stmts);
+    }
+
+    try testing.expectEqual(@as(usize, 1), stmts.len);
+    const loop_stmt = stmts[0];
+    try testing.expect(loop_stmt.* == .loop);
+
+    const loop_data = loop_stmt.loop;
+    try testing.expect(loop_data.cond == null);
+    const body = loop_data.body;
+    try testing.expect(body.* == .block);
+    try testing.expectEqual(@as(usize, 1), body.block.stmts.len);
+}
+
+test "loop with condition" {
+    const content = "loop (i < 10) { i = i + 1; }";
+    const tokens = try lex(std.testing.allocator, content);
+    defer testing.allocator.free(tokens);
+
+    var parser = try Parser.init(std.testing.allocator, tokens);
+    defer parser.deinit();
+
+    const stmts = try parser.parse();
+    defer {
+        for (stmts) |stmt| {
+            stmt.deinit(std.testing.allocator);
+        }
+        std.testing.allocator.free(stmts);
+    }
+
+    try testing.expectEqual(@as(usize, 1), stmts.len);
+    const loop_stmt = stmts[0];
+    try testing.expect(loop_stmt.* == .loop);
+
+    const loop_data = loop_stmt.loop;
+    try testing.expect(loop_data.cond != null);
+
+    const cond_expr = loop_data.cond.?;
+    try testing.expect(cond_expr.* == .binary);
+    try testing.expect(cond_expr.binary.operator == .lt);
+
+    const body = loop_data.body;
+    try testing.expect(body.* == .block);
+    try testing.expectEqual(@as(usize, 1), body.block.stmts.len);
 }

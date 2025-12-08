@@ -10,6 +10,14 @@ pub const Value = union(ValueTag) {
     int: i64,
     pid: usize,
     unit: void,
+
+    fn printValue(value: Value, writer: anytype) !void {
+        switch (value) {
+            .int => |v| try writer.print("{d}", .{v}),
+            .pid => |pid| try writer.print("pid({})", .{pid}),
+            .unit => try writer.print("()", .{}),
+        }
+    }
 };
 
 const Message = struct {
@@ -237,31 +245,35 @@ pub const VM = struct {
                 proc.ip += 1;
             },
             .lt => {
-                const lhs = try expectInt(proc.regs[instr.a]);
-                const rhs = try expectInt(proc.regs[instr.b]);
-
-                proc.cond_code = if (lhs < rhs) 1 else 0;
+                const lhs = try expectInt(proc.regs[instr.b]);
+                const rhs = try expectInt(proc.regs[instr.c]);
+                const is_true = lhs < rhs;
+                proc.cond_code = @intCast(@as(u8, @intFromBool(is_true)));
+                proc.regs[instr.a] = Value{ .int = if (is_true) 1 else 0 };
                 proc.ip += 1;
             },
             .gt => {
-                const lhs = try expectInt(proc.regs[instr.a]);
-                const rhs = try expectInt(proc.regs[instr.b]);
-
-                proc.cond_code = if (lhs > rhs) 1 else 0;
+                const lhs = try expectInt(proc.regs[instr.b]);
+                const rhs = try expectInt(proc.regs[instr.c]);
+                const is_true = lhs > rhs;
+                proc.cond_code = @intCast(@as(u8, @intFromBool(is_true)));
+                proc.regs[instr.a] = Value{ .int = if (is_true) 1 else 0 };
                 proc.ip += 1;
             },
             .lteq => {
-                const lhs = try expectInt(proc.regs[instr.a]);
-                const rhs = try expectInt(proc.regs[instr.b]);
-
-                proc.cond_code = if (lhs <= rhs) 1 else 0;
+                const lhs = try expectInt(proc.regs[instr.b]);
+                const rhs = try expectInt(proc.regs[instr.c]);
+                const is_true = lhs <= rhs;
+                proc.cond_code = @intCast(@as(u8, @intFromBool(is_true)));
+                proc.regs[instr.a] = Value{ .int = if (is_true) 1 else 0 };
                 proc.ip += 1;
             },
             .gteq => {
-                const lhs = try expectInt(proc.regs[instr.a]);
-                const rhs = try expectInt(proc.regs[instr.b]);
-
-                proc.cond_code = if (lhs >= rhs) 1 else 0;
+                const lhs = try expectInt(proc.regs[instr.b]);
+                const rhs = try expectInt(proc.regs[instr.c]);
+                const is_true = lhs >= rhs;
+                proc.cond_code = @intCast(@as(u8, @intFromBool(is_true)));
+                proc.regs[instr.a] = Value{ .int = if (is_true) 1 else 0 };
                 proc.ip += 1;
             },
             .jmp_true => {
@@ -399,16 +411,16 @@ test "condition instructions drive jumps" {
     defer vm.deinit();
 
     const code = [_]Instr{
-        .{ .op = .lt, .a = 0, .b = 1, .c = 0 }, // 1 < 2 -> true
+        .{ .op = .lt, .a = 5, .b = 0, .c = 1 }, // 1 < 2 -> true
         .{ .op = .jmp_true, .a = 3, .b = 0, .c = 0 }, // skip imm at 2
         .{ .op = .imm, .a = 2, .b = 99, .c = 0 }, // should be skipped
-        .{ .op = .gt, .a = 0, .b = 1, .c = 0 }, // 1 > 2 -> false
+        .{ .op = .gt, .a = 6, .b = 0, .c = 1 }, // 1 > 2 -> false
         .{ .op = .jmp_not, .a = 6, .b = 0, .c = 0 }, // skip imm at 5
         .{ .op = .imm, .a = 3, .b = 99, .c = 0 }, // should be skipped
-        .{ .op = .gteq, .a = 1, .b = 0, .c = 0 }, // 2 >= 1 -> true
+        .{ .op = .gteq, .a = 7, .b = 1, .c = 0 }, // 2 >= 1 -> true
         .{ .op = .jmp_true, .a = 9, .b = 0, .c = 0 }, // skip imm at 8
         .{ .op = .imm, .a = 4, .b = 99, .c = 0 }, // should be skipped
-        .{ .op = .lteq, .a = 0, .b = 0, .c = 0 }, // 1 <= 1 -> true
+        .{ .op = .lteq, .a = 8, .b = 0, .c = 0 }, // 1 <= 1 -> true
         .{ .op = .halt, .a = 0, .b = 0, .c = 0 },
     };
 
