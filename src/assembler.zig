@@ -11,33 +11,74 @@ pub const AssembleError = error{
     NumberOutOfRange,
 } || std.mem.Allocator.Error;
 
-pub const Assembler = struct {
+pub const VarContext = struct {
     alloc: std.mem.Allocator,
-    instr: std.ArrayList(vm.Instr),
-    statements: []*parser.Statement,
     var_regs: std.StringHashMapUnmanaged(u8),
     var_names: std.ArrayList([]const u8),
     next_reg: u8,
-    instructions_moved: bool,
 
-    pub fn init(alloc: std.mem.Allocator, statements: []*parser.Statement) !Assembler {
+    pub fn init(alloc: std.mem.Allocator) !VarContext {
         return .{
             .alloc = alloc,
-            .statements = statements,
-            .instr = try std.ArrayList(vm.Instr).initCapacity(alloc, 0),
             .var_regs = .{},
             .var_names = try std.ArrayList([]const u8).initCapacity(alloc, 0),
             .next_reg = 0,
-            .instructions_moved = false,
         };
     }
 
-    pub fn deinit(self: *Assembler) void {
+    pub fn deinit(self: *VarContext) void {
         for (self.var_names.items) |name| {
             self.alloc.free(name);
         }
         self.var_names.deinit(self.alloc);
         self.var_regs.deinit(self.alloc);
+    }
+};
+
+pub const Assembler = struct {
+    alloc: std.mem.Allocator,
+    instr: std.ArrayList(vm.Instr),
+    statements: []*parser.Statement,
+    var_ctx: *VarContext,
+    owned_ctx: ?VarContext,
+    last_expr_reg: ?u8,
+    instructions_moved: bool,
+
+    pub fn init(alloc: std.mem.Allocator, statements: []*parser.Statement) !Assembler {
+        const ctx = try VarContext.init(alloc);
+        var assembler = Assembler{
+            .alloc = alloc,
+            .statements = statements,
+            .instr = try std.ArrayList(vm.Instr).initCapacity(alloc, 0),
+            .var_ctx = undefined, // set below
+            .owned_ctx = ctx,
+            .last_expr_reg = null,
+            .instructions_moved = false,
+        };
+        assembler.var_ctx = &assembler.owned_ctx.?;
+        return assembler;
+    }
+
+    pub fn initWithContext(alloc: std.mem.Allocator, statements: []*parser.Statement, ctx: *VarContext) !Assembler {
+        return .{
+            .alloc = alloc,
+            .statements = statements,
+            .instr = try std.ArrayList(vm.Instr).initCapacity(alloc, 0),
+            .var_ctx = ctx,
+            .owned_ctx = null,
+            .last_expr_reg = null,
+            .instructions_moved = false,
+        };
+    }
+
+    fn context(self: *Assembler) *VarContext {
+        return if (self.owned_ctx) |*ctx| ctx else self.var_ctx;
+    }
+
+    pub fn deinit(self: *Assembler) void {
+        if (self.owned_ctx) |*ctx| {
+            ctx.deinit();
+        }
 
         if (!self.instructions_moved) {
             self.instr.deinit(self.alloc);
@@ -47,6 +88,7 @@ pub const Assembler = struct {
     /// compile tries to convert all the statements parsed by the parser into a list of instructions for
     /// the vm. The caller must free the instructions.
     pub fn compile(self: *Assembler) ![]vm.Instr {
+        self.last_expr_reg = null;
         for (self.statements) |stmt| try self.compileStatement(stmt);
         try self.instr.append(self.alloc, .{ .op = .halt, .a = 0, .b = 0, .c = 0 });
 
@@ -58,7 +100,10 @@ pub const Assembler = struct {
     fn compileStatement(self: *Assembler, stmt: *parser.Statement) AssembleError!void {
         switch (stmt.*) {
             .expression => {
-                _ = try self.compileExpr(stmt.expression.expr);
+                const out = try self.compileExpr(stmt.expression.expr);
+                if (stmt.expression.expr.* != .assign) {
+                    self.last_expr_reg = out;
+                }
             },
             .block => {
                 for (stmt.block.stmts) |s| {
@@ -182,38 +227,45 @@ pub const Assembler = struct {
     }
 
     fn lookupRegister(self: *Assembler, name: []const u8) AssembleError!u8 {
-        if (self.var_regs.get(name)) |idx| return idx;
+        if (self.context().var_regs.get(name)) |idx| return idx;
         return AssembleError.UnknownIdentifier;
     }
 
     fn getOrCreateRegister(self: *Assembler, name: []const u8) AssembleError!u8 {
-        if (self.var_regs.get(name)) |idx| return idx;
+        const ctx = self.context();
+        if (ctx.var_regs.get(name)) |idx| return idx;
 
         const reg = try self.allocateRegister();
-        const duped = try self.alloc.dupe(u8, name);
-        errdefer self.alloc.free(duped);
+        const duped = try ctx.alloc.dupe(u8, name);
+        errdefer ctx.alloc.free(duped);
 
-        try self.var_regs.put(self.alloc, duped, reg);
-        try self.var_names.append(self.alloc, duped);
+        try ctx.var_regs.put(ctx.alloc, duped, reg);
+        try ctx.var_names.append(ctx.alloc, duped);
         return reg;
     }
 
     fn allocateRegister(self: *Assembler) AssembleError!u8 {
-        const reg = self.next_reg;
+        const ctx = self.context();
+        const reg = ctx.next_reg;
         if (reg == std.math.maxInt(u8)) return AssembleError.RegisterOverflow;
-        self.next_reg +%= 1;
+        ctx.next_reg +%= 1;
         return reg;
     }
 
     /// variables returns the list of variable names that were bound to registers.
     /// The returned slice is owned by the assembler and becomes invalid after deinit.
-    pub fn variables(self: *const Assembler) []const []const u8 {
-        return self.var_names.items;
+    pub fn variables(self: *Assembler) []const []const u8 {
+        return self.context().var_names.items;
     }
 
     /// registerFor returns the register index for a variable name when present.
-    pub fn registerFor(self: *const Assembler, name: []const u8) ?u8 {
-        return self.var_regs.get(name);
+    pub fn registerFor(self: *Assembler, name: []const u8) ?u8 {
+        return self.context().var_regs.get(name);
+    }
+
+    /// lastExprRegister returns the register that holds the last pure expression result, when any.
+    pub fn lastExprRegister(self: *const Assembler) ?u8 {
+        return self.last_expr_reg;
     }
 };
 

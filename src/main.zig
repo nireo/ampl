@@ -14,6 +14,12 @@ pub fn main() !void {
 
     var stdin = std.fs.File.stdin().deprecatedReader();
 
+    var var_ctx = try assembler.VarContext.init(allocator);
+    defer var_ctx.deinit();
+
+    var values = std.StringHashMapUnmanaged(vm.Value){};
+    defer values.deinit(allocator);
+
     try stdout.print("ampl repl. enter statements ending with ';'. type :q or :quit to exit.\n", .{});
 
     while (true) {
@@ -50,7 +56,7 @@ pub fn main() !void {
             allocator.free(stmts);
         }
 
-        var assembler_ctx = assembler.Assembler.init(allocator, stmts) catch |err| {
+        var assembler_ctx = assembler.Assembler.initWithContext(allocator, stmts, &var_ctx) catch |err| {
             try stdout.print("assembler init error: {s}\n", .{@errorName(err)});
             continue;
         };
@@ -73,22 +79,43 @@ pub fn main() !void {
             continue;
         };
 
+        // hydrate registers for known variables
+        const var_names = assembler_ctx.variables();
+        if (machine.processes.items[pid]) |*proc| {
+            for (var_names) |name| {
+                if (assembler_ctx.registerFor(name)) |reg| {
+                    if (values.get(name)) |val| {
+                        proc.regs[reg] = val;
+                    }
+                }
+            }
+        }
+
         machine.run() catch |err| {
             try stdout.print("vm run error: {s}\n", .{@errorName(err)});
             continue;
         };
 
-        const vars = assembler_ctx.variables();
-        if (vars.len == 0) {
-            try stdout.print("(program produced no named variables)\n", .{});
-            continue;
+        if (assembler_ctx.lastExprRegister()) |last_reg| {
+            const value = machine.readRegister(pid, last_reg) catch |err| {
+                try stdout.print("(result read error: {s})\n", .{@errorName(err)});
+                continue;
+            };
+            try stdout.print("= ", .{});
+            try printValue(value, stdout);
+            try stdout.print("\n", .{});
         }
 
-        for (vars) |name| {
+        for (var_names) |name| {
             const reg = assembler_ctx.registerFor(name) orelse continue;
             const value = machine.readRegister(pid, reg) catch |err| {
                 try stdout.print("{s}: read error: {s}\n", .{ name, @errorName(err) });
                 continue;
+            };
+
+            // persist value for next REPL iteration
+            _ = values.put(allocator, name, value) catch {
+                try stdout.print("{s}: persist error\n", .{name});
             };
 
             try stdout.print("{s} = ", .{name});
