@@ -14,6 +14,16 @@ pub fn main() !void {
 
     var stdin = std.fs.File.stdin().deprecatedReader();
 
+    var args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    var dump_code = false;
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--dump") or std.mem.eql(u8, arg, "-d")) {
+            dump_code = true;
+        }
+    }
+
     var var_ctx = try assembler.VarContext.init(allocator);
     defer var_ctx.deinit();
 
@@ -67,6 +77,12 @@ pub fn main() !void {
             continue;
         };
         defer allocator.free(code);
+
+        if (dump_code) {
+            try stdout.print("code:\n", .{});
+            try dumpInstructions(code, stdout);
+            try stdout.print("\n", .{});
+        }
 
         var machine = vm.VM.init(allocator) catch |err| {
             try stdout.print("vm init error: {s}\n", .{@errorName(err)});
@@ -130,5 +146,17 @@ fn printValue(value: vm.Value, writer: anytype) !void {
         .int => |v| try writer.print("{d}", .{v}),
         .pid => |pid| try writer.print("pid({})", .{pid}),
         .unit => try writer.print("()", .{}),
+    }
+}
+
+fn dumpInstructions(code: []const vm.Instr, writer: anytype) !void {
+    for (code, 0..) |instr, idx| {
+        try writer.print("{d}: {s} {d} {d} {d}\n", .{
+            idx,
+            @tagName(instr.op),
+            instr.a,
+            instr.b,
+            instr.c,
+        });
     }
 }
