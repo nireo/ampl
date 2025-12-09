@@ -25,6 +25,13 @@ const Message = struct {
     payload: Value,
 };
 
+const Frame = struct {
+    regs: [MAX_REGS]Value,
+    cond_code: u8,
+    return_ip: usize,
+    return_dest: u8,
+};
+
 pub const Op = enum(u8) {
     nop,
     mov,
@@ -85,8 +92,8 @@ const ProcessStatus = enum {
 };
 
 /// Process represents a single 'actor' in the runtime. The actors have their own registers
-/// which the instructions manipulate, this obviously has very basic things such as conditionCode
-/// ip, code, call_stack etc which are very common. Additionally processes have a mailbox, which can
+/// which the instructions manipulate; they keep track of condition codes, instruction pointer,
+/// code, call frames etc which are very common. Additionally processes have a mailbox, which can
 /// be used to receive information from other processes.
 const Process = struct {
     id: usize,
@@ -95,7 +102,7 @@ const Process = struct {
     ip: usize,
     code: []const Instr,
     mailbox: std.ArrayList(Message),
-    call_stack: std.ArrayList(usize),
+    frames: std.ArrayList(Frame),
     status: ProcessStatus,
 };
 
@@ -119,7 +126,7 @@ pub const VM = struct {
         for (vm.processes.items) |*maybe_proc| {
             if (maybe_proc.*) |*proc| {
                 proc.mailbox.deinit(vm.allocator);
-                proc.call_stack.deinit(vm.allocator);
+                proc.frames.deinit(vm.allocator);
             }
         }
 
@@ -153,7 +160,7 @@ pub const VM = struct {
             .ip = start_ip,
             .code = code,
             .mailbox = mailbox,
-            .call_stack = std.ArrayList(usize).empty,
+            .frames = std.ArrayList(Frame).empty,
             .status = .ready,
         };
 
@@ -306,25 +313,43 @@ pub const VM = struct {
                 proc.ip = instr.a;
             },
             .call => {
+                const target_ip = instr.a;
                 const arg_start = @as(usize, instr.b);
                 const arg_count = @as(usize, instr.c);
                 if (arg_start + arg_count > MAX_REGS) return error.InvalidCallArgs;
 
-                // copy arguments into the callee's argument registers starting at r0
+                const frame = Frame{
+                    .regs = proc.regs,
+                    .cond_code = proc.cond_code,
+                    .return_ip = proc.ip + 1,
+                    .return_dest = instr.b,
+                };
+                try proc.frames.append(vm.allocator, frame);
+
+                var new_regs: [MAX_REGS]Value = undefined;
+                for (&new_regs) |*r| r.* = Value{ .unit = {} };
+
                 var i: usize = 0;
                 while (i < arg_count) : (i += 1) {
-                    proc.regs[i] = proc.regs[arg_start + i];
+                    new_regs[i] = frame.regs[arg_start + i];
                 }
 
-                try proc.call_stack.append(vm.allocator, proc.ip + 1);
-                proc.ip = instr.a;
+                proc.regs = new_regs;
+                proc.cond_code = 0;
+                proc.ip = target_ip;
             },
             .ret => {
-                if (proc.call_stack.items.len == 0) {
+                const ret_val = proc.regs[instr.a];
+                if (proc.frames.items.len == 0) {
                     proc.status = .dead;
                     return;
                 }
-                proc.ip = proc.call_stack.pop() orelse unreachable;
+
+                const frame = proc.frames.pop() orelse unreachable;
+                proc.regs = frame.regs;
+                proc.cond_code = frame.cond_code;
+                proc.ip = frame.return_ip;
+                proc.regs[frame.return_dest] = ret_val;
             },
             .self => {
                 proc.regs[instr.a] = Value{ .pid = proc.id };
@@ -450,7 +475,7 @@ test "call executes function and returns" {
     defer vm.deinit();
 
     const code = [_]Instr{
-        .{ .op = .call, .a = 2, .b = 0, .c = 0 }, // jump to fn
+        .{ .op = .call, .a = 2, .b = 4, .c = 2 }, // dest r4, args r4-r5
         .{ .op = .halt, .a = 0, .b = 0, .c = 0 },
         .{ .op = .add, .a = 0, .b = 0, .c = 1 }, // fn body: r0 = r0 + r1
         .{ .op = .ret, .a = 0, .b = 0, .c = 0 },
@@ -458,15 +483,18 @@ test "call executes function and returns" {
 
     const pid = try vm.spawn(&code, 0);
     var proc = &vm.processes.items[pid].?;
-    proc.regs[0] = Value{ .int = 2 };
-    proc.regs[1] = Value{ .int = 3 };
+    proc.regs[0] = Value{ .int = 9 }; // ensure caller regs survive
+    proc.regs[4] = Value{ .int = 2 };
+    proc.regs[5] = Value{ .int = 3 };
 
     try vm.run();
 
     const final = vm.processes.items[pid].?;
     try std.testing.expectEqual(@as(ProcessStatus, .dead), final.status);
-    try std.testing.expectEqual(@as(i64, 5), try expectInt(final.regs[0]));
-    try std.testing.expectEqual(@as(usize, 0), final.call_stack.items.len);
+    try std.testing.expectEqual(@as(i64, 5), try expectInt(final.regs[4]));
+    try std.testing.expectEqual(@as(i64, 9), try expectInt(final.regs[0]));
+    try std.testing.expectEqual(@as(i64, 3), try expectInt(final.regs[5]));
+    try std.testing.expectEqual(@as(usize, 0), final.frames.items.len);
 }
 
 test "call copies parameters into arg registers" {
@@ -475,25 +503,26 @@ test "call copies parameters into arg registers" {
     defer vm.deinit();
 
     const code = [_]Instr{
-        .{ .op = .call, .a = 3, .b = 2, .c = 2 }, // pass regs2-3 as params
+        .{ .op = .call, .a = 3, .b = 1, .c = 2 }, // pass regs1-2 as params
         .{ .op = .halt, .a = 0, .b = 0, .c = 0 },
         .{ .op = .nop, .a = 0, .b = 0, .c = 0 }, // padding
-        .{ .op = .add, .a = 4, .b = 0, .c = 1 }, // r4 = r0 + r1 (7+11)
-        .{ .op = .ret, .a = 0, .b = 0, .c = 0 },
+        .{ .op = .sub, .a = 3, .b = 0, .c = 1 }, // r3 = r0 - r1 (11-4)
+        .{ .op = .ret, .a = 3, .b = 0, .c = 0 },
     };
 
     const pid = try vm.spawn(&code, 0);
     var proc = &vm.processes.items[pid].?;
-    proc.regs[2] = Value{ .int = 7 };
-    proc.regs[3] = Value{ .int = 11 };
+    proc.regs[0] = Value{ .int = 100 }; // should remain unchanged
+    proc.regs[1] = Value{ .int = 11 };
+    proc.regs[2] = Value{ .int = 4 };
 
     try vm.run();
 
     const final = vm.processes.items[pid].?;
     try std.testing.expectEqual(@as(ProcessStatus, .dead), final.status);
-    try std.testing.expectEqual(@as(i64, 7), try expectInt(final.regs[0]));
-    try std.testing.expectEqual(@as(i64, 11), try expectInt(final.regs[1]));
-    try std.testing.expectEqual(@as(i64, 18), try expectInt(final.regs[4]));
+    try std.testing.expectEqual(@as(i64, 7), try expectInt(final.regs[1]));
+    try std.testing.expectEqual(@as(i64, 100), try expectInt(final.regs[0]));
+    try std.testing.expectEqual(@as(i64, 4), try expectInt(final.regs[2]));
 }
 
 test "nested calls unwind in order" {
@@ -502,29 +531,29 @@ test "nested calls unwind in order" {
     defer vm.deinit();
 
     const code = [_]Instr{
-        .{ .op = .call, .a = 2, .b = 0, .c = 0 }, // main -> outer
+        .{ .op = .imm, .a = 4, .b = 7, .c = 0 }, // load argument for outer
+        .{ .op = .call, .a = 3, .b = 4, .c = 1 }, // main -> outer(dest r4)
         .{ .op = .halt, .a = 0, .b = 0, .c = 0 },
-        .{ .op = .call, .a = 5, .b = 0, .c = 0 }, // outer -> inner
-        .{ .op = .add, .a = 2, .b = 3, .c = 1 }, // r2 = r3 + r1
-        .{ .op = .ret, .a = 0, .b = 0, .c = 0 }, // return to main
-        .{ .op = .add, .a = 3, .b = 0, .c = 1 }, // inner: r3 = r0 + r1
+        .{ .op = .call, .a = 6, .b = 1, .c = 0 }, // outer -> inner(dest r1)
+        .{ .op = .add, .a = 2, .b = 0, .c = 1 }, // r2 = arg0 + inner_ret
+        .{ .op = .ret, .a = 2, .b = 0, .c = 0 }, // return sum
+        .{ .op = .imm, .a = 0, .b = 10, .c = 0 }, // inner returns 10
         .{ .op = .ret, .a = 0, .b = 0, .c = 0 },
     };
 
     const pid = try vm.spawn(&code, 0);
     var proc = &vm.processes.items[pid].?;
-    proc.regs[0] = Value{ .int = 5 };
-    proc.regs[1] = Value{ .int = 1 };
-    proc.regs[2] = Value{ .int = 0 };
-    proc.regs[3] = Value{ .int = 0 };
+    proc.regs[0] = Value{ .int = 1 }; // ensure preserved
+    proc.regs[1] = Value{ .int = 2 };
 
     try vm.run();
 
     const final = vm.processes.items[pid].?;
     try std.testing.expectEqual(@as(ProcessStatus, .dead), final.status);
-    try std.testing.expectEqual(@as(i64, 6), try expectInt(final.regs[3]));
-    try std.testing.expectEqual(@as(i64, 7), try expectInt(final.regs[2]));
-    try std.testing.expectEqual(@as(usize, 0), final.call_stack.items.len);
+    try std.testing.expectEqual(@as(i64, 17), try expectInt(final.regs[4]));
+    try std.testing.expectEqual(@as(i64, 1), try expectInt(final.regs[0]));
+    try std.testing.expectEqual(@as(i64, 2), try expectInt(final.regs[1]));
+    try std.testing.expectEqual(@as(usize, 0), final.frames.items.len);
 }
 
 test "spawn reuses program and returns child pid" {

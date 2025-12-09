@@ -6,6 +6,8 @@ pub const AssembleError = error{
     UnsupportedStatement,
     UnsupportedExpression,
     UnknownIdentifier,
+    UnknownFunction,
+    DuplicateFunction,
     UnsupportedOperator,
     RegisterOverflow,
     NumberOutOfRange,
@@ -13,17 +15,23 @@ pub const AssembleError = error{
 
 pub const VarContext = struct {
     alloc: std.mem.Allocator,
-    var_regs: std.StringHashMapUnmanaged(u8),
+    entries: std.ArrayList(Entry),
     var_names: std.ArrayList([]const u8),
     next_reg: u8,
 
+    const Entry = struct {
+        name: []const u8,
+        reg: u8,
+    };
+
     pub fn init(alloc: std.mem.Allocator) !VarContext {
-        return .{
+        const ctx = VarContext{
             .alloc = alloc,
-            .var_regs = .{},
+            .entries = try std.ArrayList(Entry).initCapacity(alloc, 0),
             .var_names = try std.ArrayList([]const u8).initCapacity(alloc, 0),
             .next_reg = 0,
         };
+        return ctx;
     }
 
     pub fn deinit(self: *VarContext) void {
@@ -31,7 +39,7 @@ pub const VarContext = struct {
             self.alloc.free(name);
         }
         self.var_names.deinit(self.alloc);
-        self.var_regs.deinit(self.alloc);
+        self.entries.deinit(self.alloc);
     }
 };
 
@@ -40,45 +48,73 @@ pub const Assembler = struct {
     instr: std.ArrayList(vm.Instr),
     statements: []*parser.Statement,
     var_ctx: *VarContext,
-    owned_ctx: ?VarContext,
+    current_ctx: *VarContext,
+    owned_ctx: ?*VarContext,
     last_expr_reg: ?u8,
     instructions_moved: bool,
+    functions: std.StringHashMap(FunctionInfo),
+    function_order: std.ArrayList([]const u8),
+    call_fixups: std.ArrayList(CallFixup),
+
+    const FunctionInfo = struct {
+        stmt: *parser.Statement,
+        start_ip: ?u8 = null,
+    };
+
+    const CallFixup = struct {
+        instr_idx: usize,
+        name: []const u8,
+    };
 
     pub fn init(alloc: std.mem.Allocator, statements: []*parser.Statement) !Assembler {
-        const ctx = try VarContext.init(alloc);
-        var assembler = Assembler{
+        const ctx_ptr = try alloc.create(VarContext);
+        errdefer alloc.destroy(ctx_ptr);
+        ctx_ptr.* = try VarContext.init(alloc);
+
+        return Assembler{
             .alloc = alloc,
             .statements = statements,
             .instr = try std.ArrayList(vm.Instr).initCapacity(alloc, 0),
-            .var_ctx = undefined, // set below
-            .owned_ctx = ctx,
+            .var_ctx = ctx_ptr,
+            .current_ctx = ctx_ptr,
+            .owned_ctx = ctx_ptr,
             .last_expr_reg = null,
             .instructions_moved = false,
+            .functions = std.StringHashMap(FunctionInfo).init(alloc),
+            .function_order = try std.ArrayList([]const u8).initCapacity(alloc, 0),
+            .call_fixups = try std.ArrayList(CallFixup).initCapacity(alloc, 0),
         };
-        assembler.var_ctx = &assembler.owned_ctx.?;
-        return assembler;
     }
 
     pub fn initWithContext(alloc: std.mem.Allocator, statements: []*parser.Statement, ctx: *VarContext) !Assembler {
         return .{
-            .alloc = alloc,
-            .statements = statements,
-            .instr = try std.ArrayList(vm.Instr).initCapacity(alloc, 0),
-            .var_ctx = ctx,
+        .alloc = alloc,
+        .statements = statements,
+        .instr = try std.ArrayList(vm.Instr).initCapacity(alloc, 0),
+        .var_ctx = ctx,
+        .current_ctx = ctx,
             .owned_ctx = null,
             .last_expr_reg = null,
             .instructions_moved = false,
-        };
-    }
+            .functions = std.StringHashMap(FunctionInfo).init(alloc),
+            .function_order = try std.ArrayList([]const u8).initCapacity(alloc, 0),
+            .call_fixups = try std.ArrayList(CallFixup).initCapacity(alloc, 0),
+    };
+}
 
     fn context(self: *Assembler) *VarContext {
-        return if (self.owned_ctx) |*ctx| ctx else self.var_ctx;
+        return self.current_ctx;
     }
 
     pub fn deinit(self: *Assembler) void {
-        if (self.owned_ctx) |*ctx| {
-            ctx.deinit();
+        if (self.owned_ctx) |ctx_ptr| {
+            ctx_ptr.deinit();
+            self.alloc.destroy(ctx_ptr);
         }
+
+        self.functions.deinit();
+        self.function_order.deinit(self.alloc);
+        self.call_fixups.deinit(self.alloc);
 
         if (!self.instructions_moved) {
             self.instr.deinit(self.alloc);
@@ -89,12 +125,83 @@ pub const Assembler = struct {
     /// the vm. The caller must free the instructions.
     pub fn compile(self: *Assembler) ![]vm.Instr {
         self.last_expr_reg = null;
-        for (self.statements) |stmt| try self.compileStatement(stmt);
+        self.functions.clearRetainingCapacity();
+        self.function_order.clearRetainingCapacity();
+        self.call_fixups.clearRetainingCapacity();
+        try self.functions.ensureTotalCapacity(4);
+
+        try self.collectFunctions();
+
+        for (self.statements) |stmt| {
+            if (stmt.* == .fn_def) continue; // compiled later
+            try self.compileStatement(stmt);
+        }
         try self.instr.append(self.alloc, .{ .op = .halt, .a = 0, .b = 0, .c = 0 });
+
+        try self.compileFunctions();
+        try self.patchCallTargets();
 
         const code = try self.instr.toOwnedSlice(self.alloc);
         self.instructions_moved = true;
         return code;
+    }
+
+    fn collectFunctions(self: *Assembler) AssembleError!void {
+        for (self.statements) |stmt| {
+            if (stmt.* != .fn_def) continue;
+            const name = stmt.fn_def.name;
+            if (self.functions.contains(name)) return AssembleError.DuplicateFunction;
+
+            try self.functions.put(name, .{ .stmt = stmt });
+            try self.function_order.append(self.alloc, name);
+        }
+    }
+
+    fn compileFunctions(self: *Assembler) AssembleError!void {
+        for (self.function_order.items) |name| {
+            var info = self.functions.getPtr(name) orelse unreachable;
+            info.start_ip = @intCast(self.instr.items.len);
+            try self.compileFunction(info.stmt);
+        }
+    }
+
+    fn patchCallTargets(self: *Assembler) AssembleError!void {
+        for (self.call_fixups.items) |fixup| {
+            const info = self.functions.get(fixup.name) orelse return AssembleError.UnknownFunction;
+            const target = info.start_ip orelse return AssembleError.UnknownFunction;
+            self.instr.items[fixup.instr_idx].a = target;
+        }
+    }
+
+    fn compileFunction(self: *Assembler, stmt: *parser.Statement) AssembleError!void {
+        const fn_def = &stmt.fn_def;
+        var fn_ctx = try VarContext.init(self.alloc);
+        defer fn_ctx.deinit();
+
+        for (fn_def.params, 0..) |param, idx| {
+            const duped = try fn_ctx.alloc.dupe(u8, param.name);
+            errdefer fn_ctx.alloc.free(duped);
+            try fn_ctx.entries.append(fn_ctx.alloc, .{
+                .name = duped,
+                .reg = @intCast(idx),
+            });
+            try fn_ctx.var_names.append(fn_ctx.alloc, duped);
+        }
+        fn_ctx.next_reg = @intCast(fn_def.params.len);
+
+        const prev_ctx = self.current_ctx;
+        self.current_ctx = &fn_ctx;
+        defer self.current_ctx = prev_ctx;
+
+        const prev_last_expr = self.last_expr_reg;
+        self.last_expr_reg = null;
+        defer self.last_expr_reg = prev_last_expr;
+
+        try self.compileStatement(fn_def.body);
+
+        if (self.instr.items.len == 0 or self.instr.items[self.instr.items.len - 1].op != .ret) {
+            try self.instr.append(self.alloc, .{ .op = .ret, .a = 0, .b = 0, .c = 0 });
+        }
     }
 
     fn compileStatement(self: *Assembler, stmt: *parser.Statement) AssembleError!void {
@@ -110,8 +217,10 @@ pub const Assembler = struct {
                     try self.compileStatement(s);
                 }
             },
+            .fn_def => {},
             .if_stmt => try self.compileIfStatement(stmt),
             .loop => try self.compileLoop(stmt),
+            .ret => try self.compileReturn(stmt),
             else => return AssembleError.UnsupportedStatement,
         }
     }
@@ -122,7 +231,7 @@ pub const Assembler = struct {
             .identifier => try self.lookupRegister(expr.identifier),
             .assign => try self.compileAssign(expr.assign.name, expr.assign.value),
             .binary => try self.compileBinary(expr.binary.left, expr.binary.operator, expr.binary.right),
-            else => AssembleError.UnsupportedExpression,
+            .function_call => try self.compileFunctionCall(expr.function_call.name, expr.function_call.args),
         };
     }
 
@@ -192,6 +301,16 @@ pub const Assembler = struct {
         }
     }
 
+    fn compileReturn(self: *Assembler, stmt: *parser.Statement) AssembleError!void {
+        const ret_stmt = &stmt.ret;
+        var ret_reg: u8 = 0;
+        if (ret_stmt.value) |val| {
+            ret_reg = try self.compileExpr(val);
+        }
+
+        try self.instr.append(self.alloc, .{ .op = .ret, .a = ret_reg, .b = 0, .c = 0 });
+    }
+
     fn compileAssign(self: *Assembler, name: []const u8, value: *parser.Expr) AssembleError!u8 {
         const dest = try self.getOrCreateRegister(name);
         const value_reg = try self.compileExpr(value);
@@ -219,6 +338,47 @@ pub const Assembler = struct {
         return out;
     }
 
+    fn compileFunctionCall(self: *Assembler, name: []const u8, args: []*parser.Expr) AssembleError!u8 {
+        if (!self.functions.contains(name)) return AssembleError.UnknownFunction;
+
+        var compiled_args = try std.ArrayList(u8).initCapacity(self.alloc, args.len);
+        defer compiled_args.deinit(self.alloc);
+
+        for (args) |arg| {
+            const reg = try self.compileExpr(arg);
+            try compiled_args.append(self.alloc, reg);
+        }
+
+        var call_regs = try std.ArrayList(u8).initCapacity(self.alloc, args.len);
+        defer call_regs.deinit(self.alloc);
+
+        for (compiled_args.items) |src| {
+            const target = try self.allocateRegister();
+            try call_regs.append(self.alloc, target);
+            if (target != src) {
+                try self.instr.append(self.alloc, .{ .op = .mov, .a = target, .b = src, .c = 0 });
+            }
+        }
+
+        const dest_reg: u8 = if (call_regs.items.len > 0) call_regs.items[0] else try self.allocateRegister();
+        if (call_regs.items.len > std.math.maxInt(u8)) return AssembleError.NumberOutOfRange;
+        const arg_count: u8 = @intCast(call_regs.items.len);
+        const info = self.functions.get(name).?;
+
+        const instr_idx = self.instr.items.len;
+        const target_ip: u8 = if (info.start_ip) |ip| ip else 0;
+        try self.instr.append(self.alloc, .{ .op = .call, .a = target_ip, .b = dest_reg, .c = arg_count });
+
+        if (info.start_ip == null) {
+            try self.call_fixups.append(self.alloc, .{
+                .instr_idx = instr_idx,
+                .name = name,
+            });
+        }
+
+        return dest_reg;
+    }
+
     fn loadNumber(self: *Assembler, value: i64) AssembleError!u8 {
         if (value < 0 or value > std.math.maxInt(u8)) return AssembleError.NumberOutOfRange;
         const reg = try self.allocateRegister();
@@ -227,19 +387,24 @@ pub const Assembler = struct {
     }
 
     fn lookupRegister(self: *Assembler, name: []const u8) AssembleError!u8 {
-        if (self.context().var_regs.get(name)) |idx| return idx;
+        const ctx = self.context();
+        for (ctx.entries.items) |entry| {
+            if (std.mem.eql(u8, entry.name, name)) return entry.reg;
+        }
         return AssembleError.UnknownIdentifier;
     }
 
     fn getOrCreateRegister(self: *Assembler, name: []const u8) AssembleError!u8 {
         const ctx = self.context();
-        if (ctx.var_regs.get(name)) |idx| return idx;
+        for (ctx.entries.items) |entry| {
+            if (std.mem.eql(u8, entry.name, name)) return entry.reg;
+        }
 
         const reg = try self.allocateRegister();
         const duped = try ctx.alloc.dupe(u8, name);
         errdefer ctx.alloc.free(duped);
 
-        try ctx.var_regs.put(ctx.alloc, duped, reg);
+        try ctx.entries.append(ctx.alloc, .{ .name = duped, .reg = reg });
         try ctx.var_names.append(ctx.alloc, duped);
         return reg;
     }
@@ -260,7 +425,11 @@ pub const Assembler = struct {
 
     /// registerFor returns the register index for a variable name when present.
     pub fn registerFor(self: *Assembler, name: []const u8) ?u8 {
-        return self.context().var_regs.get(name);
+        const ctx = self.context();
+        for (ctx.entries.items) |entry| {
+            if (std.mem.eql(u8, entry.name, name)) return entry.reg;
+        }
+        return null;
     }
 
     /// lastExprRegister returns the register that holds the last pure expression result, when any.
@@ -406,6 +575,50 @@ test "loop condition drives execution" {
     const proc = machine.processes.items[pid].?;
     switch (proc.regs[0]) {
         .int => |val| try testing.expectEqual(@as(i64, 3), val),
+        else => try testing.expect(false),
+    }
+}
+
+test "function definitions compile and calls preserve caller registers" {
+    const src = "def add(a, b) { ret a + b; } x = 5; y = add(x, 7);";
+    const tokens = try parser.lex(testing.allocator, src);
+    defer testing.allocator.free(tokens);
+
+    var p = try parser.Parser.init(testing.allocator, tokens);
+    defer p.deinit();
+
+    const stmts = try p.parse();
+    defer {
+        for (stmts) |stmt| stmt.deinit(testing.allocator);
+        testing.allocator.free(stmts);
+    }
+
+    var assembler = try Assembler.init(testing.allocator, stmts);
+    defer assembler.deinit();
+
+    const code = try assembler.compile();
+    defer testing.allocator.free(code);
+
+    var machine = try vm.VM.init(testing.allocator);
+    defer machine.deinit();
+
+    const pid = try machine.spawn(code, 0);
+    try machine.run();
+
+    try testing.expect(assembler.registerFor("x") != null);
+    try testing.expect(assembler.registerFor("y") != null);
+    const x_reg = assembler.registerFor("x").?;
+    const y_reg = assembler.registerFor("y").?;
+
+    const x_val = try machine.readRegister(pid, x_reg);
+    switch (x_val) {
+        .int => |val| try testing.expectEqual(@as(i64, 5), val),
+        else => try testing.expect(false),
+    }
+
+    const y_val = try machine.readRegister(pid, y_reg);
+    switch (y_val) {
+        .int => |val| try testing.expectEqual(@as(i64, 12), val),
         else => try testing.expect(false),
     }
 }
