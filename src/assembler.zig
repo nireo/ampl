@@ -13,6 +13,8 @@ pub const AssembleError = error{
     NumberOutOfRange,
 } || std.mem.Allocator.Error;
 
+/// VarContext constains all of the varialbes in a given context. It is mainly used to keep track of
+/// registers
 pub const VarContext = struct {
     alloc: std.mem.Allocator,
     entries: std.ArrayList(Entry),
@@ -88,19 +90,19 @@ pub const Assembler = struct {
 
     pub fn initWithContext(alloc: std.mem.Allocator, statements: []*parser.Statement, ctx: *VarContext) !Assembler {
         return .{
-        .alloc = alloc,
-        .statements = statements,
-        .instr = try std.ArrayList(vm.Instr).initCapacity(alloc, 0),
-        .var_ctx = ctx,
-        .current_ctx = ctx,
+            .alloc = alloc,
+            .statements = statements,
+            .instr = try std.ArrayList(vm.Instr).initCapacity(alloc, 0),
+            .var_ctx = ctx,
+            .current_ctx = ctx,
             .owned_ctx = null,
             .last_expr_reg = null,
             .instructions_moved = false,
             .functions = std.StringHashMap(FunctionInfo).init(alloc),
             .function_order = try std.ArrayList([]const u8).initCapacity(alloc, 0),
             .call_fixups = try std.ArrayList(CallFixup).initCapacity(alloc, 0),
-    };
-}
+        };
+    }
 
     fn context(self: *Assembler) *VarContext {
         return self.current_ctx;
