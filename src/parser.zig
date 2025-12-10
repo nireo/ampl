@@ -282,6 +282,36 @@ pub const Expr = union(ExprTag) {
         }
         alloc.destroy(self);
     }
+
+    pub fn dump(self: *Expr, writer: anytype, indent: usize) !void {
+        for (0..indent) |_| {
+            try writer.print("  ", .{});
+        }
+
+        switch (self.*) {
+            .number => {
+                try writer.print("number: {d}\n", .{self.number});
+            },
+            .identifier => {
+                try writer.print("identifier: {s}\n", .{self.identifier});
+            },
+            .binary => {
+                try writer.print("binary operator: {s}\n", .{@tagName(self.binary.operator)});
+                try self.binary.left.dump(writer, indent + 1);
+                try self.binary.right.dump(writer, indent + 1);
+            },
+            .assign => {
+                try writer.print("assign to: {s}\n", .{self.assign.name});
+                try self.assign.value.dump(writer, indent + 1);
+            },
+            .function_call => {
+                try writer.print("function call: {s}\n", .{self.function_call.name});
+                for (self.function_call.args) |arg| {
+                    try arg.dump(writer, indent + 1);
+                }
+            },
+        }
+    }
 };
 
 const Param = struct {
@@ -359,7 +389,63 @@ pub const Statement = union(StatementTag) {
         }
         alloc.destroy(self);
     }
+
+    pub fn dump(self: *Statement, writer: anytype, indent: usize) !void {
+        for (0..indent) |_| {
+            try writer.print("  ", .{});
+        }
+
+        switch (self.*) {
+            .expression => {
+                try writer.print("expr:\n", .{});
+                try self.expression.expr.dump(writer, indent + 1);
+            },
+            .block => {
+                try writer.print("block:\n", .{});
+                for (self.block.stmts) |stmt| {
+                    try stmt.dump(writer, indent + 1);
+                }
+            },
+            .fn_def => {
+                try writer.print("fn def: {s}\n", .{self.fn_def.name});
+                try self.fn_def.body.dump(writer, indent + 1);
+            },
+            .var_def => {
+                try writer.print("variable definition: {s}\n", .{self.var_def.name});
+                if (self.var_def.value) |val| {
+                    try val.dump(writer, indent + 1);
+                }
+            },
+            .ret => {
+                try writer.print("return statement:\n", .{});
+                if (self.ret.value) |val| {
+                    try val.dump(writer, indent + 1);
+                }
+            },
+            .if_stmt => {
+                try writer.print("if statement:\n", .{});
+                try self.if_stmt.expr.dump(writer, indent + 1);
+                try self.if_stmt.then_branch.dump(writer, indent + 1);
+                if (self.if_stmt.else_branch) |eb| {
+                    try eb.dump(writer, indent + 1);
+                }
+            },
+            .loop => {
+                try writer.print("loop statement:\n", .{});
+                if (self.loop.cond) |c| {
+                    try c.dump(writer, indent + 1);
+                }
+                try self.loop.body.dump(writer, indent + 1);
+            },
+        }
+    }
 };
+
+pub fn dumpStatements(stmts: []*Statement, writer: anytype) !void {
+    for (stmts) |stmt| {
+        try stmt.dump(writer, 0);
+    }
+}
 
 pub const Parser = struct {
     tokens: []const Token,
