@@ -1062,3 +1062,69 @@ test "loop with condition" {
     try testing.expect(body.* == .block);
     try testing.expectEqual(@as(usize, 1), body.block.stmts.len);
 }
+
+test "expression dump shows structure" {
+    const content = "a = 1 + 2;";
+    const tokens = try lex(testing.allocator, content);
+    defer testing.allocator.free(tokens);
+
+    var parser = try Parser.init(testing.allocator, tokens);
+    defer parser.deinit();
+
+    const stmts = try parser.parse();
+    defer {
+        for (stmts) |stmt| {
+            stmt.deinit(testing.allocator);
+        }
+        testing.allocator.free(stmts);
+    }
+
+    try testing.expectEqual(@as(usize, 1), stmts.len);
+    const stmt = stmts[0];
+    try testing.expect(stmt.* == .expression);
+
+    var output = try std.ArrayList(u8).initCapacity(testing.allocator, 0);
+    defer output.deinit(testing.allocator);
+
+    try stmt.expression.expr.dump(output.writer(testing.allocator), 0);
+
+    const dumped = try output.toOwnedSlice(testing.allocator);
+    defer testing.allocator.free(dumped);
+
+    try testing.expectEqualStrings(
+        "assign to: a\n  binary operator: plus\n    number: 1\n    number: 2\n",
+        dumped,
+    );
+}
+
+test "statement dump includes branches" {
+    const content = "if (x < 10) { ret x; } else { ret 0; }";
+    const tokens = try lex(testing.allocator, content);
+    defer testing.allocator.free(tokens);
+
+    var parser = try Parser.init(testing.allocator, tokens);
+    defer parser.deinit();
+
+    const stmts = try parser.parse();
+    defer {
+        for (stmts) |stmt| {
+            stmt.deinit(testing.allocator);
+        }
+        testing.allocator.free(stmts);
+    }
+
+    try testing.expectEqual(@as(usize, 1), stmts.len);
+
+    var output = try std.ArrayList(u8).initCapacity(testing.allocator, 0);
+    defer output.deinit(testing.allocator);
+
+    try dumpStatements(stmts, output.writer(testing.allocator));
+
+    const dumped = try output.toOwnedSlice(testing.allocator);
+    defer testing.allocator.free(dumped);
+
+    try testing.expectEqualStrings(
+        "if statement:\n  binary operator: lt\n    identifier: x\n    number: 10\n  block:\n    return statement:\n      identifier: x\n  block:\n    return statement:\n      number: 0\n",
+        dumped,
+    );
+}

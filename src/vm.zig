@@ -11,7 +11,7 @@ pub const Value = union(ValueTag) {
     pid: usize,
     unit: void,
 
-    fn printValue(value: Value, writer: anytype) !void {
+    pub fn print(value: Value, writer: anytype) !void {
         switch (value) {
             .int => |v| try writer.print("{d}", .{v}),
             .pid => |pid| try writer.print("pid({})", .{pid}),
@@ -61,7 +61,7 @@ pub const Instr = struct {
     b: u8,
     c: u8,
 
-    fn debugPrint(self: Instr) void {
+    fn print(self: Instr) void {
         std.debug.print("\t{} {} {} {}\n", .{ self.op, self.a, self.b, self.c });
     }
 };
@@ -69,7 +69,7 @@ pub const Instr = struct {
 fn debugInstructions(code: []const Instr) void {
     for (code, 0..) |instr, idx| {
         std.debug.print("{}: ", .{idx});
-        instr.debugPrint();
+        instr.print();
     }
 }
 
@@ -187,6 +187,8 @@ pub const VM = struct {
             if (maybe_proc.*) |*proc| {
                 if (proc.status != .ready) continue; // skip waiting/dead
 
+                // each process has a set of reductions since we don't want to for example switch between processes
+                // every time an 'add' is executed
                 var reductions: usize = REDUCTIONS_PER_SLICE;
                 while (reductions > 0 and proc.status == .ready) : (reductions -= 1) {
                     try vm.execute(proc);

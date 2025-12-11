@@ -18,9 +18,14 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     var dump_code = false;
+    var dump_ast = false;
     for (args[1..]) |arg| {
-        if (std.mem.eql(u8, arg, "--dump") or std.mem.eql(u8, arg, "-d")) {
+        if (std.mem.eql(u8, arg, "--dump-code") or std.mem.eql(u8, arg, "-dc")) {
             dump_code = true;
+        }
+
+        if (std.mem.eql(u8, arg, "--dump-ast") or std.mem.eql(u8, arg, "-da")) {
+            dump_ast = true;
         }
     }
 
@@ -64,6 +69,12 @@ pub fn main() !void {
         defer {
             for (stmts) |stmt| stmt.deinit(allocator);
             allocator.free(stmts);
+        }
+
+        if (dump_ast) {
+            try stdout.println("ast:\n", .{});
+            try parser.dumpStatements(stmts, stdout);
+            try stdout.println("\n", .{});
         }
 
         var assembler_ctx = assembler.Assembler.initWithContext(allocator, stmts, &var_ctx) catch |err| {
@@ -118,7 +129,7 @@ pub fn main() !void {
                 continue;
             };
             try stdout.print("= ", .{});
-            try printValue(value, stdout);
+            try value.print(stdout);
             try stdout.print("\n", .{});
         }
 
@@ -135,17 +146,9 @@ pub fn main() !void {
             };
 
             try stdout.print("{s} = ", .{name});
-            try printValue(value, stdout);
+            try value.print(stdout);
             try stdout.print("\n", .{});
         }
-    }
-}
-
-fn printValue(value: vm.Value, writer: anytype) !void {
-    switch (value) {
-        .int => |v| try writer.print("{d}", .{v}),
-        .pid => |pid| try writer.print("pid({})", .{pid}),
-        .unit => try writer.print("()", .{}),
     }
 }
 

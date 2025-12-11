@@ -58,6 +58,7 @@ pub const Assembler = struct {
     function_order: std.ArrayList([]const u8),
     call_fixups: std.ArrayList(CallFixup),
 
+    /// FunctionInfo contains the parsed structure of the function and the instruction where it starts
     const FunctionInfo = struct {
         stmt: *parser.Statement,
         start_ip: ?u8 = null,
@@ -88,6 +89,8 @@ pub const Assembler = struct {
         };
     }
 
+    /// initWithContext allocates everything the assembler needs and uses an existing context. This is mainly used
+    /// such that the repl can have a persistent state over many code lines.
     pub fn initWithContext(alloc: std.mem.Allocator, statements: []*parser.Statement, ctx: *VarContext) !Assembler {
         return .{
             .alloc = alloc,
@@ -104,10 +107,12 @@ pub const Assembler = struct {
         };
     }
 
+    /// context returns the current variable context
     fn context(self: *Assembler) *VarContext {
         return self.current_ctx;
     }
 
+    /// deinit frees up the memory that it allocated for itself. It does not free the parsed structures
     pub fn deinit(self: *Assembler) void {
         if (self.owned_ctx) |ctx_ptr| {
             ctx_ptr.deinit();
