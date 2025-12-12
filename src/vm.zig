@@ -300,10 +300,12 @@ pub const VM = struct {
                 }
             },
             .recv => {
+                // block until we get a message
                 if (proc.mailbox.items.len == 0) {
                     proc.status = .waiting;
                     return;
                 }
+
                 const msg = proc.mailbox.orderedRemove(0);
                 proc.regs[instr.a] = msg.payload;
                 if (instr.b != instr.a) {

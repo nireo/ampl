@@ -11,6 +11,7 @@ pub const AssembleError = error{
     UnsupportedOperator,
     RegisterOverflow,
     NumberOutOfRange,
+    WrongAmountOfArguments,
 } || std.mem.Allocator.Error;
 
 /// VarContext constains all of the varialbes in a given context. It is mainly used to keep track of
@@ -345,9 +346,33 @@ pub const Assembler = struct {
         return out;
     }
 
+    /// compileRecv compiles the built in recv implementation. We need to specially handle this because
+    /// this can't be implemented using the code itself, as it uses the internal mailbox. it takes in the
+    /// arguments just to validate that they're isn't any to keep the other functions clean
+    fn compileRecv(self: *Assembler, args: []*parser.Expr) AssembleError!u8 {
+        if (args.len != 0) return AssembleError.WrongAmountOfArguments;
+        const dest_reg = try self.allocateRegister();
+        try self.instr.append(self.alloc, .{ .op = .recv, .a = dest_reg, .b = dest_reg, .c = 0 });
+        return dest_reg;
+    }
+
+    fn compileSend(self: *Assembler, args: []*parser.Expr) AssembleError!u8 {
+        if (args.len != 2) return AssembleError.WrongAmountOfArguments;
+
+        const pid_reg = try self.compileExpr(args[0]);
+        const payload_reg = try self.compileExpr(args[1]);
+        try self.instr.append(self.alloc, .{ .op = .send, .a = pid_reg, .b = payload_reg, .c = 0 });
+        return payload_reg;
+    }
+
     fn compileFunctionCall(self: *Assembler, name: []const u8, args: []*parser.Expr) AssembleError!u8 {
+        if (std.mem.eql(u8, "recv", name)) return try self.compileRecv(args);
+        if (std.mem.eql(u8, "send", name)) return try self.compileSend(args);
+
+        // check if the function exists
         if (!self.functions.contains(name)) return AssembleError.UnknownFunction;
 
+        // compile each argument given to the function
         var compiled_args = try std.ArrayList(u8).initCapacity(self.alloc, args.len);
         defer compiled_args.deinit(self.alloc);
 
@@ -359,6 +384,7 @@ pub const Assembler = struct {
         var call_regs = try std.ArrayList(u8).initCapacity(self.alloc, args.len);
         defer call_regs.deinit(self.alloc);
 
+        // try to allocate a register for each argument
         for (compiled_args.items) |src| {
             const target = try self.allocateRegister();
             try call_regs.append(self.alloc, target);
@@ -367,6 +393,7 @@ pub const Assembler = struct {
             }
         }
 
+        // try to reuse the first call register for the result of the function
         const dest_reg: u8 = if (call_regs.items.len > 0) call_regs.items[0] else try self.allocateRegister();
         if (call_regs.items.len > std.math.maxInt(u8)) return AssembleError.NumberOutOfRange;
         const arg_count: u8 = @intCast(call_regs.items.len);
@@ -628,4 +655,58 @@ test "function definitions compile and calls preserve caller registers" {
         .int => |val| try testing.expectEqual(@as(i64, 12), val),
         else => try testing.expect(false),
     }
+}
+
+test "recv compiles to recv opcode" {
+    const src = "result = recv();";
+    const tokens = try parser.lex(testing.allocator, src);
+    defer testing.allocator.free(tokens);
+
+    var p = try parser.Parser.init(testing.allocator, tokens);
+    defer p.deinit();
+
+    const stmts = try p.parse();
+    defer {
+        for (stmts) |stmt| stmt.deinit(testing.allocator);
+        testing.allocator.free(stmts);
+    }
+
+    var assembler = try Assembler.init(testing.allocator, stmts);
+    defer assembler.deinit();
+
+    const code = try assembler.compile();
+    defer testing.allocator.free(code);
+
+    try testing.expectEqual(vm.Op.recv, code[0].op);
+    try testing.expectEqual(vm.Op.halt, code[code.len - 1].op);
+}
+
+test "send compiles to send opcode" {
+    const src = "a = 1; b = 2; send(a, b);";
+    const tokens = try parser.lex(testing.allocator, src);
+    defer testing.allocator.free(tokens);
+
+    var p = try parser.Parser.init(testing.allocator, tokens);
+    defer p.deinit();
+
+    const stmts = try p.parse();
+    defer {
+        for (stmts) |stmt| stmt.deinit(testing.allocator);
+        testing.allocator.free(stmts);
+    }
+
+    var assembler = try Assembler.init(testing.allocator, stmts);
+    defer assembler.deinit();
+
+    const code = try assembler.compile();
+    defer testing.allocator.free(code);
+
+    const send_instr = code[4];
+    const a_reg = assembler.registerFor("a").?;
+    const b_reg = assembler.registerFor("b").?;
+
+    try testing.expectEqual(vm.Op.send, send_instr.op);
+    try testing.expectEqual(a_reg, send_instr.a);
+    try testing.expectEqual(b_reg, send_instr.b);
+    try testing.expectEqual(vm.Op.halt, code[code.len - 1].op);
 }
