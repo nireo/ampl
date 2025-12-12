@@ -16,6 +16,7 @@ pub const ParseError = ParserError || std.mem.Allocator.Error;
 pub const TokenTag = enum {
     identifier,
     number,
+    string,
     keyword_let,
     keyword_spawn,
     keyword_loop,
@@ -119,6 +120,23 @@ pub fn lex(alloc: std.mem.Allocator, source: []const u8) ![]Token {
                 .lexeme = source[start..loc],
             });
             col += loc - start;
+            continue;
+        }
+
+        if (source[loc] == '"') {
+            const start = loc + 1;
+            const sl = source[start..];
+            const end = std.mem.indexOfScalar(u8, sl, '"') orelse return LexerError.UnrecognizedChar;
+            const content = sl[0..end];
+
+            try tokens.append(alloc, Token{
+                .column = col,
+                .line = line,
+                .tag = .string,
+                .lexeme = content,
+            });
+            loc = start + end + 1;
+            col += end + 2; // include both quotes
             continue;
         }
 
@@ -241,6 +259,7 @@ pub const StatementTag = enum {
 pub const ExprTag = enum {
     number,
     identifier,
+    string,
     binary,
     assign,
     function_call,
@@ -249,6 +268,7 @@ pub const ExprTag = enum {
 pub const Expr = union(ExprTag) {
     number: i64,
     identifier: []const u8,
+    string: []const u8,
     binary: struct {
         left: *Expr,
         operator: TokenTag,
@@ -272,6 +292,9 @@ pub const Expr = union(ExprTag) {
             .assign => {
                 self.assign.value.deinit(alloc);
             },
+            .string => {
+                alloc.free(self.string);
+            },
             .function_call => {
                 for (self.function_call.args) |arg| {
                     arg.deinit(alloc);
@@ -294,6 +317,9 @@ pub const Expr = union(ExprTag) {
             },
             .identifier => {
                 try writer.print("identifier: {s}\n", .{self.identifier});
+            },
+            .string => {
+                try writer.print("string: \"{s}\"\n", .{self.string});
             },
             .binary => {
                 try writer.print("binary operator: {s}\n", .{@tagName(self.binary.operator)});
@@ -520,6 +546,14 @@ pub const Parser = struct {
                 expr.* = .{
                     .number = value,
                 };
+                return expr;
+            },
+            .string => {
+                _ = self.advance();
+                const duped = try self.alloc.dupe(u8, tok.lexeme);
+                errdefer self.alloc.free(duped);
+                const expr = try self.alloc.create(Expr);
+                expr.* = .{ .string = duped };
                 return expr;
             },
             .identifier => {

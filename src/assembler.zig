@@ -46,6 +46,26 @@ pub const VarContext = struct {
     }
 };
 
+pub const Program = struct {
+    code: []vm.Instr,
+    strings: [][]const u8,
+
+    pub fn toVM(self: *const Program) vm.Program {
+        return .{
+            .code = self.code,
+            .strings = self.strings,
+        };
+    }
+
+    pub fn deinit(self: *Program, alloc: std.mem.Allocator) void {
+        alloc.free(self.code);
+        for (self.strings) |s| {
+            alloc.free(@constCast(s));
+        }
+        alloc.free(self.strings);
+    }
+};
+
 pub const Assembler = struct {
     alloc: std.mem.Allocator,
     instr: std.ArrayList(vm.Instr),
@@ -55,6 +75,8 @@ pub const Assembler = struct {
     owned_ctx: ?*VarContext,
     last_expr_reg: ?u8,
     instructions_moved: bool,
+    string_pool: std.ArrayList([]const u8),
+    strings_moved: bool,
     functions: std.StringHashMap(FunctionInfo),
     function_order: std.ArrayList([]const u8),
     call_fixups: std.ArrayList(CallFixup),
@@ -84,6 +106,8 @@ pub const Assembler = struct {
             .owned_ctx = ctx_ptr,
             .last_expr_reg = null,
             .instructions_moved = false,
+            .string_pool = try std.ArrayList([]const u8).initCapacity(alloc, 0),
+            .strings_moved = false,
             .functions = std.StringHashMap(FunctionInfo).init(alloc),
             .function_order = try std.ArrayList([]const u8).initCapacity(alloc, 0),
             .call_fixups = try std.ArrayList(CallFixup).initCapacity(alloc, 0),
@@ -102,6 +126,8 @@ pub const Assembler = struct {
             .owned_ctx = null,
             .last_expr_reg = null,
             .instructions_moved = false,
+            .string_pool = try std.ArrayList([]const u8).initCapacity(alloc, 0),
+            .strings_moved = false,
             .functions = std.StringHashMap(FunctionInfo).init(alloc),
             .function_order = try std.ArrayList([]const u8).initCapacity(alloc, 0),
             .call_fixups = try std.ArrayList(CallFixup).initCapacity(alloc, 0),
@@ -123,6 +149,12 @@ pub const Assembler = struct {
         self.functions.deinit();
         self.function_order.deinit(self.alloc);
         self.call_fixups.deinit(self.alloc);
+        if (!self.strings_moved) {
+            for (self.string_pool.items) |s| self.alloc.free(@constCast(s));
+            self.string_pool.deinit(self.alloc);
+        } else {
+            self.string_pool.deinit(self.alloc);
+        }
 
         if (!self.instructions_moved) {
             self.instr.deinit(self.alloc);
@@ -131,12 +163,16 @@ pub const Assembler = struct {
 
     /// compile tries to convert all the statements parsed by the parser into a list of instructions for
     /// the vm. The caller must free the instructions.
-    pub fn compile(self: *Assembler) ![]vm.Instr {
+    pub fn compile(self: *Assembler) !Program {
         self.last_expr_reg = null;
         self.functions.clearRetainingCapacity();
         self.function_order.clearRetainingCapacity();
         self.call_fixups.clearRetainingCapacity();
+        for (self.string_pool.items) |s| self.alloc.free(@constCast(s));
+        self.string_pool.clearRetainingCapacity();
         try self.functions.ensureTotalCapacity(4);
+        self.strings_moved = false;
+        self.instructions_moved = false;
 
         try self.collectFunctions();
 
@@ -151,7 +187,13 @@ pub const Assembler = struct {
 
         const code = try self.instr.toOwnedSlice(self.alloc);
         self.instructions_moved = true;
-        return code;
+        const strings = try self.string_pool.toOwnedSlice(self.alloc);
+        self.strings_moved = true;
+
+        return Program{
+            .code = code,
+            .strings = strings,
+        };
     }
 
     fn collectFunctions(self: *Assembler) AssembleError!void {
@@ -236,6 +278,7 @@ pub const Assembler = struct {
     fn compileExpr(self: *Assembler, expr: *parser.Expr) AssembleError!u8 {
         return switch (expr.*) {
             .number => try self.loadNumber(expr.number),
+            .string => try self.loadString(expr.string),
             .identifier => try self.lookupRegister(expr.identifier),
             .assign => try self.compileAssign(expr.assign.name, expr.assign.value),
             .binary => try self.compileBinary(expr.binary.left, expr.binary.operator, expr.binary.right),
@@ -420,6 +463,32 @@ pub const Assembler = struct {
         return reg;
     }
 
+    fn internString(self: *Assembler, value: []const u8) AssembleError!u8 {
+        for (self.string_pool.items, 0..) |s, idx| {
+            if (std.mem.eql(u8, s, value)) {
+                if (idx > std.math.maxInt(u8)) return AssembleError.NumberOutOfRange;
+                return @intCast(idx);
+            }
+        }
+
+        const duped = try self.alloc.dupe(u8, value);
+        errdefer self.alloc.free(duped);
+
+        const const_duped: []const u8 = duped;
+        try self.string_pool.append(self.alloc, const_duped);
+        if (self.string_pool.items.len - 1 > std.math.maxInt(u8)) {
+            return AssembleError.NumberOutOfRange;
+        }
+        return @intCast(self.string_pool.items.len - 1);
+    }
+
+    fn loadString(self: *Assembler, value: []const u8) AssembleError!u8 {
+        const idx = try self.internString(value);
+        const reg = try self.allocateRegister();
+        try self.instr.append(self.alloc, .{ .op = vm.Op.str, .a = reg, .b = idx, .c = 0 });
+        return reg;
+    }
+
     fn lookupRegister(self: *Assembler, name: []const u8) AssembleError!u8 {
         const ctx = self.context();
         for (ctx.entries.items) |entry| {
@@ -491,9 +560,10 @@ test "assemble simple addition assignment" {
     var assembler = try Assembler.init(testing.allocator, stmts);
     defer assembler.deinit();
 
-    const code = try assembler.compile();
-    defer testing.allocator.free(code);
+    var program = try assembler.compile();
+    defer program.deinit(testing.allocator);
 
+    const code = program.code;
     try testing.expectEqual(@as(usize, 5), code.len);
     try testing.expect(code[0].op == .imm);
     try testing.expect(code[1].op == .imm);
@@ -504,7 +574,7 @@ test "assemble simple addition assignment" {
     var machine = try vm.VM.init(testing.allocator);
     defer machine.deinit();
 
-    const pid = try machine.spawn(code, 0);
+    const pid = try machine.spawn(program.toVM(), 0);
     try machine.run();
 
     const proc = machine.processes.items[pid].?;
@@ -531,13 +601,13 @@ test "if statement executes then branch" {
     var assembler = try Assembler.init(testing.allocator, stmts);
     defer assembler.deinit();
 
-    const code = try assembler.compile();
-    defer testing.allocator.free(code);
+    var program = try assembler.compile();
+    defer program.deinit(testing.allocator);
 
     var machine = try vm.VM.init(testing.allocator);
     defer machine.deinit();
 
-    const pid = try machine.spawn(code, 0);
+    const pid = try machine.spawn(program.toVM(), 0);
     try machine.run();
 
     const proc = machine.processes.items[pid].?;
@@ -564,13 +634,13 @@ test "if statement skips then without else" {
     var assembler = try Assembler.init(testing.allocator, stmts);
     defer assembler.deinit();
 
-    const code = try assembler.compile();
-    defer testing.allocator.free(code);
+    var program = try assembler.compile();
+    defer program.deinit(testing.allocator);
 
     var machine = try vm.VM.init(testing.allocator);
     defer machine.deinit();
 
-    const pid = try machine.spawn(code, 0);
+    const pid = try machine.spawn(program.toVM(), 0);
     try machine.run();
 
     const proc = machine.processes.items[pid].?;
@@ -597,13 +667,13 @@ test "loop condition drives execution" {
     var assembler = try Assembler.init(testing.allocator, stmts);
     defer assembler.deinit();
 
-    const code = try assembler.compile();
-    defer testing.allocator.free(code);
+    var program = try assembler.compile();
+    defer program.deinit(testing.allocator);
 
     var machine = try vm.VM.init(testing.allocator);
     defer machine.deinit();
 
-    const pid = try machine.spawn(code, 0);
+    const pid = try machine.spawn(program.toVM(), 0);
     try machine.run();
 
     const proc = machine.processes.items[pid].?;
@@ -630,13 +700,13 @@ test "function definitions compile and calls preserve caller registers" {
     var assembler = try Assembler.init(testing.allocator, stmts);
     defer assembler.deinit();
 
-    const code = try assembler.compile();
-    defer testing.allocator.free(code);
+    var program = try assembler.compile();
+    defer program.deinit(testing.allocator);
 
     var machine = try vm.VM.init(testing.allocator);
     defer machine.deinit();
 
-    const pid = try machine.spawn(code, 0);
+    const pid = try machine.spawn(program.toVM(), 0);
     try machine.run();
 
     try testing.expect(assembler.registerFor("x") != null);
@@ -674,9 +744,10 @@ test "recv compiles to recv opcode" {
     var assembler = try Assembler.init(testing.allocator, stmts);
     defer assembler.deinit();
 
-    const code = try assembler.compile();
-    defer testing.allocator.free(code);
+    var program = try assembler.compile();
+    defer program.deinit(testing.allocator);
 
+    const code = program.code;
     try testing.expectEqual(vm.Op.recv, code[0].op);
     try testing.expectEqual(vm.Op.halt, code[code.len - 1].op);
 }
@@ -698,9 +769,10 @@ test "send compiles to send opcode" {
     var assembler = try Assembler.init(testing.allocator, stmts);
     defer assembler.deinit();
 
-    const code = try assembler.compile();
-    defer testing.allocator.free(code);
+    var program = try assembler.compile();
+    defer program.deinit(testing.allocator);
 
+    const code = program.code;
     const send_instr = code[4];
     const a_reg = assembler.registerFor("a").?;
     const b_reg = assembler.registerFor("b").?;
@@ -709,4 +781,60 @@ test "send compiles to send opcode" {
     try testing.expectEqual(a_reg, send_instr.a);
     try testing.expectEqual(b_reg, send_instr.b);
     try testing.expectEqual(vm.Op.halt, code[code.len - 1].op);
+}
+
+test "string literal compiles into string pool and str opcode" {
+    const src = "greeting = \"hi\";";
+    const tokens = try parser.lex(testing.allocator, src);
+    defer testing.allocator.free(tokens);
+
+    var p = try parser.Parser.init(testing.allocator, tokens);
+    defer p.deinit();
+
+    const stmts = try p.parse();
+    defer {
+        for (stmts) |stmt| stmt.deinit(testing.allocator);
+        testing.allocator.free(stmts);
+    }
+
+    var assembler = try Assembler.init(testing.allocator, stmts);
+    defer assembler.deinit();
+
+    var program = try assembler.compile();
+    defer program.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), program.strings.len);
+    try testing.expectEqualStrings("hi", program.strings[0]);
+
+    const code = program.code;
+    try testing.expectEqual(vm.Op.str, code[0].op);
+    try testing.expectEqual(@as(u8, 0), code[0].b);
+    try testing.expectEqual(vm.Op.halt, code[code.len - 1].op);
+}
+
+test "identical string literals are interned once" {
+    const src = "a = \"same\"; b = \"same\";";
+    const tokens = try parser.lex(testing.allocator, src);
+    defer testing.allocator.free(tokens);
+
+    var p = try parser.Parser.init(testing.allocator, tokens);
+    defer p.deinit();
+
+    const stmts = try p.parse();
+    defer {
+        for (stmts) |stmt| stmt.deinit(testing.allocator);
+        testing.allocator.free(stmts);
+    }
+
+    var assembler = try Assembler.init(testing.allocator, stmts);
+    defer assembler.deinit();
+
+    var program = try assembler.compile();
+    defer program.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), program.strings.len);
+    const code = program.code;
+    try testing.expectEqual(vm.Op.str, code[0].op);
+    try testing.expectEqual(vm.Op.str, code[2].op);
+    try testing.expectEqual(code[0].b, code[2].b); // reused pool index
 }

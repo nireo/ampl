@@ -1,21 +1,129 @@
 const std = @import("std");
 
+const StringHandle = u32;
+
 pub const ValueTag = enum {
     int,
     pid,
     unit,
+    string,
 };
 
 pub const Value = union(ValueTag) {
     int: i64,
     pid: usize,
     unit: void,
+    string: StringHandle,
 
-    pub fn print(value: Value, writer: anytype) !void {
+    pub fn print(value: Value, heap: ?*const Heap, writer: anytype) !void {
         switch (value) {
             .int => |v| try writer.print("{d}", .{v}),
             .pid => |pid| try writer.print("pid({})", .{pid}),
             .unit => try writer.print("()", .{}),
+            .string => |handle| {
+                if (heap) |h| {
+                    if (h.get(handle)) |s| {
+                        try writer.print("\"{s}\"", .{s});
+                    } else {
+                        try writer.print("<freed string {}>", .{handle});
+                    }
+                } else {
+                    try writer.print("<string {}>", .{handle});
+                }
+            },
+        }
+    }
+};
+
+pub const Program = struct {
+    code: []const Instr,
+    strings: []const []const u8,
+};
+
+const HeapString = struct {
+    data: []u8,
+    marked: bool,
+    in_use: bool,
+};
+
+pub const Heap = struct {
+    allocator: std.mem.Allocator,
+    entries: std.ArrayList(HeapString),
+
+    pub fn init(alloc: std.mem.Allocator) !Heap {
+        return .{
+            .allocator = alloc,
+            .entries = try std.ArrayList(HeapString).initCapacity(alloc, 16),
+        };
+    }
+
+    pub fn deinit(self: *Heap) void {
+        for (self.entries.items) |entry| {
+            if (entry.in_use) {
+                self.allocator.free(entry.data);
+            }
+        }
+        self.entries.deinit(self.allocator);
+    }
+
+    pub fn allocString(self: *Heap, bytes: []const u8) !StringHandle {
+        const duped = try self.allocator.dupe(u8, bytes);
+        errdefer self.allocator.free(duped);
+
+        // try to find a free slot first
+        for (self.entries.items, 0..) |entry, idx| {
+            if (!entry.in_use) {
+                self.entries.items[idx] = .{
+                    .data = duped,
+                    .marked = false,
+                    .in_use = true,
+                };
+                return @intCast(idx);
+            }
+        }
+
+        const idx = self.entries.items.len;
+        try self.entries.append(self.allocator, .{
+            .data = duped,
+            .marked = false,
+            .in_use = true,
+        });
+        return @intCast(idx);
+    }
+
+    pub fn get(self: *const Heap, handle: StringHandle) ?[]const u8 {
+        const idx: usize = @intCast(handle);
+        if (idx >= self.entries.items.len) return null;
+        const entry = self.entries.items[idx];
+        if (!entry.in_use) return null;
+        return entry.data;
+    }
+
+    pub fn clearMarks(self: *Heap) void {
+        for (self.entries.items) |*entry| {
+            entry.marked = false;
+        }
+    }
+
+    pub fn mark(self: *Heap, handle: StringHandle) void {
+        const idx: usize = @intCast(handle);
+        if (idx >= self.entries.items.len) return;
+        const entry = &self.entries.items[idx];
+        if (!entry.in_use) return;
+        entry.marked = true;
+    }
+
+    pub fn sweep(self: *Heap) void {
+        for (self.entries.items) |*entry| {
+            if (!entry.in_use) continue;
+            if (entry.marked) {
+                entry.marked = false;
+                continue;
+            }
+
+            self.allocator.free(entry.data);
+            entry.data = &[_]u8{};
+            entry.in_use = false;
         }
     }
 };
@@ -36,6 +144,7 @@ pub const Op = enum(u8) {
     nop,
     mov,
     imm,
+    str,
     add,
     sub,
     spawn,
@@ -100,7 +209,7 @@ const Process = struct {
     regs: [MAX_REGS]Value,
     cond_code: u8,
     ip: usize,
-    code: []const Instr,
+    program: Program,
     mailbox: std.ArrayList(Message),
     frames: std.ArrayList(Frame),
     status: ProcessStatus,
@@ -110,6 +219,7 @@ pub const VM = struct {
     allocator: std.mem.Allocator,
     processes: std.ArrayList(?Process),
     run_queue: std.ArrayList(usize),
+    heap: Heap,
 
     /// init sets up a basic vm with some capacity for processes and a run queue.
     pub fn init(alloc: std.mem.Allocator) !VM {
@@ -117,6 +227,7 @@ pub const VM = struct {
             .allocator = alloc,
             .processes = try std.ArrayList(?Process).initCapacity(alloc, 128),
             .run_queue = try std.ArrayList(usize).initCapacity(alloc, 128),
+            .heap = try Heap.init(alloc),
         };
     }
 
@@ -133,12 +244,13 @@ pub const VM = struct {
         // deinit the arrays themselves.
         vm.processes.deinit(vm.allocator);
         vm.run_queue.deinit(vm.allocator);
+        vm.heap.deinit();
     }
 
-    /// spawn sets up a new process with some given code and a staring instruction pointer.
+    /// spawn sets up a new process with some given program and a staring instruction pointer.
     /// It first tries to look for a processor in the list if every processor is taken it adds
     /// a new one to the list. this function also appends the new process to the run queue.
-    pub fn spawn(vm: *VM, code: []const Instr, start_ip: usize) !usize {
+    pub fn spawn(vm: *VM, program: Program, start_ip: usize) !usize {
         // look for some available process; append to array if not found
         var pid: usize = undefined;
         for (vm.processes.items, 0..) |maybe_proc, i| {
@@ -151,6 +263,8 @@ pub const VM = struct {
             try vm.processes.append(vm.allocator, null);
         }
 
+        if (start_ip >= program.code.len) return error.InvalidStartIp;
+
         // basic process init & run queue append
         const mailbox = std.ArrayList(Message).empty;
         var proc = Process{
@@ -158,7 +272,7 @@ pub const VM = struct {
             .regs = undefined,
             .cond_code = 0,
             .ip = start_ip,
-            .code = code,
+            .program = program,
             .mailbox = mailbox,
             .frames = std.ArrayList(Frame).empty,
             .status = .ready,
@@ -204,12 +318,12 @@ pub const VM = struct {
 
     /// execute executes the next instruction in the processor.
     fn execute(vm: *VM, proc: *Process) !void {
-        if (proc.ip >= proc.code.len) {
+        if (proc.ip >= proc.program.code.len) {
             proc.status = .dead;
             return;
         }
 
-        const instr = proc.code[proc.ip];
+        const instr = proc.program.code[proc.ip];
         switch (instr.op) {
             .nop => {
                 proc.ip += 1;
@@ -220,6 +334,13 @@ pub const VM = struct {
             },
             .imm => {
                 proc.regs[instr.a] = Value{ .int = instr.b };
+                proc.ip += 1;
+            },
+            .str => {
+                const idx: usize = instr.b;
+                if (idx >= proc.program.strings.len) return error.InvalidStringIndex;
+                const handle = try vm.heap.allocString(proc.program.strings[idx]);
+                proc.regs[instr.a] = Value{ .string = handle };
                 proc.ip += 1;
             },
             .add => {
@@ -236,7 +357,7 @@ pub const VM = struct {
             },
             .spawn => {
                 const child_ip = @as(usize, instr.b);
-                const pid = try vm.spawn(proc.code, child_ip);
+                const pid = try vm.spawn(proc.program, child_ip);
                 proc.regs[instr.a] = Value{ .pid = pid };
                 proc.ip += 1;
             },
@@ -385,6 +506,45 @@ pub const VM = struct {
         }
     }
 
+    fn markValue(vm: *VM, value: Value) void {
+        switch (value) {
+            .string => |handle| vm.heap.mark(handle),
+            else => {},
+        }
+    }
+
+    /// collect runs a simple mark & sweep over all string values visible to the VM.
+    pub fn collect(vm: *VM) void {
+        vm.heap.clearMarks();
+
+        for (vm.processes.items) |maybe_proc| {
+            if (maybe_proc) |proc| {
+                for (proc.regs) |v| markValue(vm, v);
+                for (proc.frames.items) |frame| {
+                    for (frame.regs) |v| markValue(vm, v);
+                }
+                for (proc.mailbox.items) |msg| {
+                    markValue(vm, msg.payload);
+                }
+            }
+        }
+
+        vm.heap.sweep();
+    }
+
+    pub fn liveStrings(vm: *VM) usize {
+        var count: usize = 0;
+        for (vm.heap.entries.items) |entry| {
+            if (entry.in_use) count += 1;
+        }
+        return count;
+    }
+
+    pub fn allocString(vm: *VM, bytes: []const u8) !Value {
+        const handle = try vm.heap.allocString(bytes);
+        return Value{ .string = handle };
+    }
+
     /// readRegister returns the value stored in a register for a given process id.
     pub fn readRegister(vm: *VM, pid: usize, reg: usize) !Value {
         if (pid >= vm.processes.items.len) return error.NoSuchPid;
@@ -421,7 +581,8 @@ test "arithmetic instructions execute" {
 
     debugInstructions(&code);
 
-    const pid = try vm.spawn(&code, 0);
+    const program = Program{ .code = &code, .strings = &[_][]const u8{} };
+    const pid = try vm.spawn(program, 0);
     var proc = &vm.processes.items[pid].?;
     proc.regs[0] = Value{ .int = 2 };
     proc.regs[1] = Value{ .int = 3 };
@@ -453,7 +614,8 @@ test "condition instructions drive jumps" {
         .{ .op = .halt, .a = 0, .b = 0, .c = 0 },
     };
 
-    const pid = try vm.spawn(&code, 0);
+    const program = Program{ .code = &code, .strings = &[_][]const u8{} };
+    const pid = try vm.spawn(program, 0);
     var proc = &vm.processes.items[pid].?;
     proc.regs[0] = Value{ .int = 1 };
     proc.regs[1] = Value{ .int = 2 };
@@ -485,7 +647,8 @@ test "call executes function and returns" {
         .{ .op = .ret, .a = 0, .b = 0, .c = 0 },
     };
 
-    const pid = try vm.spawn(&code, 0);
+    const program = Program{ .code = &code, .strings = &[_][]const u8{} };
+    const pid = try vm.spawn(program, 0);
     var proc = &vm.processes.items[pid].?;
     proc.regs[0] = Value{ .int = 9 }; // ensure caller regs survive
     proc.regs[4] = Value{ .int = 2 };
@@ -514,7 +677,8 @@ test "call copies parameters into arg registers" {
         .{ .op = .ret, .a = 3, .b = 0, .c = 0 },
     };
 
-    const pid = try vm.spawn(&code, 0);
+    const program = Program{ .code = &code, .strings = &[_][]const u8{} };
+    const pid = try vm.spawn(program, 0);
     var proc = &vm.processes.items[pid].?;
     proc.regs[0] = Value{ .int = 100 }; // should remain unchanged
     proc.regs[1] = Value{ .int = 11 };
@@ -545,7 +709,8 @@ test "nested calls unwind in order" {
         .{ .op = .ret, .a = 0, .b = 0, .c = 0 },
     };
 
-    const pid = try vm.spawn(&code, 0);
+    const program = Program{ .code = &code, .strings = &[_][]const u8{} };
+    const pid = try vm.spawn(program, 0);
     var proc = &vm.processes.items[pid].?;
     proc.regs[0] = Value{ .int = 1 }; // ensure preserved
     proc.regs[1] = Value{ .int = 2 };
@@ -571,7 +736,8 @@ test "spawn reuses program and returns child pid" {
         .{ .op = .halt, .a = 0, .b = 0, .c = 0 },
     };
 
-    const parent_pid = try vm.spawn(&code, 0);
+    const program = Program{ .code = &code, .strings = &[_][]const u8{} };
+    const parent_pid = try vm.spawn(program, 0);
     try vm.run();
 
     const parent = vm.processes.items[parent_pid].?;
@@ -595,8 +761,10 @@ test "send wakes waiting receiver" {
         .{ .op = .halt, .a = 0, .b = 0, .c = 0 },
     };
 
-    const recv_pid = try vm.spawn(&recv_code, 0);
-    const send_pid = try vm.spawn(&send_code, 0);
+    const recv_program = Program{ .code = &recv_code, .strings = &[_][]const u8{} };
+    const send_program = Program{ .code = &send_code, .strings = &[_][]const u8{} };
+    const recv_pid = try vm.spawn(recv_program, 0);
+    const send_pid = try vm.spawn(send_program, 0);
 
     var sender = &vm.processes.items[send_pid].?;
     sender.regs[0] = Value{ .pid = recv_pid };
@@ -624,8 +792,10 @@ test "recv captures sender when requested" {
         .{ .op = .halt, .a = 0, .b = 0, .c = 0 },
     };
 
-    const recv_pid = try vm.spawn(&recv_code, 0);
-    const send_pid = try vm.spawn(&send_code, 0);
+    const recv_program = Program{ .code = &recv_code, .strings = &[_][]const u8{} };
+    const send_program = Program{ .code = &send_code, .strings = &[_][]const u8{} };
+    const recv_pid = try vm.spawn(recv_program, 0);
+    const send_pid = try vm.spawn(send_program, 0);
 
     var sender = &vm.processes.items[send_pid].?;
     sender.regs[0] = Value{ .pid = recv_pid };
@@ -648,9 +818,76 @@ test "self writes current pid" {
         .{ .op = .halt, .a = 0, .b = 0, .c = 0 },
     };
 
-    const pid = try vm.spawn(&code, 0);
+    const program = Program{ .code = &code, .strings = &[_][]const u8{} };
+    const pid = try vm.spawn(program, 0);
     try vm.run();
 
     const proc = vm.processes.items[pid].?;
     try std.testing.expectEqual(pid, try expectPid(proc.regs[3]));
+}
+
+test "strings allocate and are collected when unreachable" {
+    const gpa = std.testing.allocator;
+    var vm = try VM.init(gpa);
+    defer vm.deinit();
+
+    const program = Program{
+        .code = &[_]Instr{
+            .{ .op = .str, .a = 0, .b = 0, .c = 0 },
+            .{ .op = .halt, .a = 0, .b = 0, .c = 0 },
+        },
+        .strings = &[_][]const u8{"hello"},
+    };
+
+    const pid = try vm.spawn(program, 0);
+    try vm.run();
+
+    const val = try vm.readRegister(pid, 0);
+    var handle: StringHandle = 0;
+    switch (val) {
+        .string => |h| handle = h,
+        else => try std.testing.expect(false),
+    }
+
+    try std.testing.expect(vm.heap.get(handle) != null);
+    try std.testing.expectEqual(@as(usize, 1), vm.liveStrings());
+
+    if (vm.processes.items[pid]) |*proc| {
+        proc.regs[0] = Value{ .unit = {} };
+    }
+
+    vm.collect();
+    try std.testing.expectEqual(@as(usize, 0), vm.liveStrings());
+    try std.testing.expect(vm.heap.get(handle) == null);
+}
+
+test "strings in mailboxes survive collection" {
+    const gpa = std.testing.allocator;
+    var vm = try VM.init(gpa);
+    defer vm.deinit();
+
+    const program = Program{
+        .code = &[_]Instr{ .{ .op = .halt, .a = 0, .b = 0, .c = 0 } },
+        .strings = &[_][]const u8{},
+    };
+
+    const pid = try vm.spawn(program, 0);
+    const msg = try vm.allocString("queued");
+    // clear register so mailbox is sole root
+    if (vm.processes.items[pid]) |*proc| {
+        proc.regs[0] = Value{ .unit = {} };
+    }
+
+    try vm.sendMessage(0, pid, msg);
+    try std.testing.expectEqual(@as(usize, 1), vm.liveStrings());
+
+    vm.collect();
+    try std.testing.expectEqual(@as(usize, 1), vm.liveStrings()); // mailbox kept it
+
+    // dequeue and drop message, then collect again
+    if (vm.processes.items[pid]) |*proc| {
+        _ = proc.mailbox.orderedRemove(0);
+    }
+    vm.collect();
+    try std.testing.expectEqual(@as(usize, 0), vm.liveStrings());
 }

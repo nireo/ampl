@@ -83,15 +83,15 @@ pub fn main() !void {
         };
         defer assembler_ctx.deinit();
 
-        const code = assembler_ctx.compile() catch |err| {
+        var program = assembler_ctx.compile() catch |err| {
             try stdout.print("assemble error: {s}\n", .{@errorName(err)});
             continue;
         };
-        defer allocator.free(code);
+        defer program.deinit(allocator);
 
         if (dump_code) {
             try stdout.print("code:\n", .{});
-            try dumpInstructions(code, stdout);
+            try dumpInstructions(program.code, stdout);
             try stdout.print("\n", .{});
         }
 
@@ -101,7 +101,7 @@ pub fn main() !void {
         };
         defer machine.deinit();
 
-        const pid = machine.spawn(code, 0) catch |err| {
+        const pid = machine.spawn(program.toVM(), 0) catch |err| {
             try stdout.print("vm spawn error: {s}\n", .{@errorName(err)});
             continue;
         };
@@ -129,7 +129,7 @@ pub fn main() !void {
                 continue;
             };
             try stdout.print("= ", .{});
-            try value.print(stdout);
+            try value.print(&machine.heap, stdout);
             try stdout.print("\n", .{});
         }
 
@@ -146,7 +146,7 @@ pub fn main() !void {
             };
 
             try stdout.print("{s} = ", .{name});
-            try value.print(stdout);
+            try value.print(&machine.heap, stdout);
             try stdout.print("\n", .{});
         }
     }
