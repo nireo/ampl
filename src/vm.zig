@@ -40,27 +40,43 @@ pub const Program = struct {
     strings: []const []const u8,
 };
 
-const HeapString = struct {
-    data: []u8,
+const HeapObjectTag = enum {
+    string,
+};
+
+const HeapObjectData = union(HeapObjectTag) {
+    string: []u8,
+
+    pub fn deinit(self: *HeapObjectData, alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .string => {
+                alloc.free(self.string);
+            },
+        }
+    }
+};
+
+const HeapObject = struct {
     marked: bool,
     in_use: bool,
+    data: HeapObjectData,
 };
 
 pub const Heap = struct {
     allocator: std.mem.Allocator,
-    entries: std.ArrayList(HeapString),
+    entries: std.ArrayList(HeapObject),
 
     pub fn init(alloc: std.mem.Allocator) !Heap {
         return .{
             .allocator = alloc,
-            .entries = try std.ArrayList(HeapString).initCapacity(alloc, 16),
+            .entries = try std.ArrayList(HeapObject).initCapacity(alloc, 16),
         };
     }
 
     pub fn deinit(self: *Heap) void {
-        for (self.entries.items) |entry| {
+        for (self.entries.items) |*entry| {
             if (entry.in_use) {
-                self.allocator.free(entry.data);
+                entry.data.deinit(self.allocator);
             }
         }
         self.entries.deinit(self.allocator);
@@ -70,11 +86,13 @@ pub const Heap = struct {
         const duped = try self.allocator.dupe(u8, bytes);
         errdefer self.allocator.free(duped);
 
+        const data = HeapObjectData{ .string = duped };
+
         // try to find a free slot first
         for (self.entries.items, 0..) |entry, idx| {
             if (!entry.in_use) {
                 self.entries.items[idx] = .{
-                    .data = duped,
+                    .data = data,
                     .marked = false,
                     .in_use = true,
                 };
@@ -84,7 +102,7 @@ pub const Heap = struct {
 
         const idx = self.entries.items.len;
         try self.entries.append(self.allocator, .{
-            .data = duped,
+            .data = data,
             .marked = false,
             .in_use = true,
         });
@@ -96,7 +114,7 @@ pub const Heap = struct {
         if (idx >= self.entries.items.len) return null;
         const entry = self.entries.items[idx];
         if (!entry.in_use) return null;
-        return entry.data;
+        return entry.data.string;
     }
 
     pub fn clearMarks(self: *Heap) void {
@@ -121,8 +139,9 @@ pub const Heap = struct {
                 continue;
             }
 
-            self.allocator.free(entry.data);
-            entry.data = &[_]u8{};
+            entry.data.deinit(self.allocator);
+            entry.data = HeapObjectData{ .string = &[_]u8{} };
+            entry.marked = false;
             entry.in_use = false;
         }
     }
@@ -867,7 +886,7 @@ test "strings in mailboxes survive collection" {
     defer vm.deinit();
 
     const program = Program{
-        .code = &[_]Instr{ .{ .op = .halt, .a = 0, .b = 0, .c = 0 } },
+        .code = &[_]Instr{.{ .op = .halt, .a = 0, .b = 0, .c = 0 }},
         .strings = &[_][]const u8{},
     };
 
