@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const StringHandle = u32;
+const HeapHandle = u32;
 
 pub const ValueTag = enum {
     int,
@@ -13,7 +13,7 @@ pub const Value = union(ValueTag) {
     int: i64,
     pid: usize,
     unit: void,
-    string: StringHandle,
+    string: HeapHandle,
 
     pub fn print(value: Value, heap: ?*const Heap, writer: anytype) !void {
         switch (value) {
@@ -82,7 +82,7 @@ pub const Heap = struct {
         self.entries.deinit(self.allocator);
     }
 
-    pub fn allocString(self: *Heap, bytes: []const u8) !StringHandle {
+    pub fn allocString(self: *Heap, bytes: []const u8) !HeapHandle {
         const duped = try self.allocator.dupe(u8, bytes);
         errdefer self.allocator.free(duped);
 
@@ -109,7 +109,7 @@ pub const Heap = struct {
         return @intCast(idx);
     }
 
-    pub fn get(self: *const Heap, handle: StringHandle) ?[]const u8 {
+    pub fn get(self: *const Heap, handle: HeapHandle) ?[]const u8 {
         const idx: usize = @intCast(handle);
         if (idx >= self.entries.items.len) return null;
         const entry = self.entries.items[idx];
@@ -117,13 +117,15 @@ pub const Heap = struct {
         return entry.data.string;
     }
 
+    /// clearMarks goes through all of the items and sets the marked flag to false.
     pub fn clearMarks(self: *Heap) void {
         for (self.entries.items) |*entry| {
             entry.marked = false;
         }
     }
 
-    pub fn mark(self: *Heap, handle: StringHandle) void {
+    /// mark takes in a given heap handle and makes that given item. It doesn't do anything if the heap handle is invalid.
+    pub fn mark(self: *Heap, handle: HeapHandle) void {
         const idx: usize = @intCast(handle);
         if (idx >= self.entries.items.len) return;
         const entry = &self.entries.items[idx];
@@ -131,6 +133,8 @@ pub const Heap = struct {
         entry.marked = true;
     }
 
+    /// sweep goes through all of the entries and frees their contents if they're not in use and they're marked. If they're not in use
+    /// but they're marked then we remove the mark and skip said entry.
     pub fn sweep(self: *Heap) void {
         for (self.entries.items) |*entry| {
             if (!entry.in_use) continue;
@@ -181,6 +185,7 @@ pub const Op = enum(u8) {
     gteq,
     jmp_true,
     jmp_not,
+    print,
 };
 
 pub const Instr = struct {
@@ -501,6 +506,26 @@ pub const VM = struct {
             },
             .halt => {
                 proc.status = .dead;
+            },
+            .print => {
+                var stdout_buffer: [256]u8 = undefined;
+                var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+                const stdout = &stdout_writer.interface;
+                const val = proc.regs[instr.a];
+                switch (val) {
+                    .int => |v| try stdout.print("{d}\n", .{v}),
+                    .pid => |pid| try stdout.print("pid({})\n", .{pid}),
+                    .unit => try stdout.print("()\n", .{}),
+                    .string => |handle| {
+                        if (vm.heap.get(handle)) |s| {
+                            try stdout.print("\"{s}\"\n", .{s});
+                        } else {
+                            try stdout.print("<string {}>\n", .{handle});
+                        }
+                    },
+                }
+                try stdout.flush();
+                proc.ip += 1;
             },
         }
     }
@@ -862,7 +887,7 @@ test "strings allocate and are collected when unreachable" {
     try vm.run();
 
     const val = try vm.readRegister(pid, 0);
-    var handle: StringHandle = 0;
+    var handle: HeapHandle = 0;
     switch (val) {
         .string => |h| handle = h,
         else => try std.testing.expect(false),

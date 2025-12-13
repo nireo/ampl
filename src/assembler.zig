@@ -271,7 +271,7 @@ pub const Assembler = struct {
             .if_stmt => try self.compileIfStatement(stmt),
             .loop => try self.compileLoop(stmt),
             .ret => try self.compileReturn(stmt),
-            else => return AssembleError.UnsupportedStatement,
+            .var_def => try self.compileVarDef(stmt),
         }
     }
 
@@ -408,9 +408,28 @@ pub const Assembler = struct {
         return payload_reg;
     }
 
+    fn compileVarDef(self: *Assembler, stmt: *parser.Statement) AssembleError!void {
+        const vd = &stmt.var_def;
+        const dest = try self.getOrCreateRegister(vd.name);
+        if (vd.value) |val| {
+            const value_reg = try self.compileExpr(val);
+            if (value_reg != dest) {
+                try self.instr.append(self.alloc, .{ .op = .mov, .a = dest, .b = value_reg, .c = 0 });
+            }
+        }
+    }
+
+    fn compilePrint(self: *Assembler, args: []*parser.Expr) AssembleError!u8 {
+        if (args.len != 1) return AssembleError.WrongAmountOfArguments;
+        const src = try self.compileExpr(args[0]);
+        try self.instr.append(self.alloc, .{ .op = .print, .a = src, .b = 0, .c = 0 });
+        return src;
+    }
+
     fn compileFunctionCall(self: *Assembler, name: []const u8, args: []*parser.Expr) AssembleError!u8 {
         if (std.mem.eql(u8, "recv", name)) return try self.compileRecv(args);
         if (std.mem.eql(u8, "send", name)) return try self.compileSend(args);
+        if (std.mem.eql(u8, "print", name)) return try self.compilePrint(args);
 
         // check if the function exists
         if (!self.functions.contains(name)) return AssembleError.UnknownFunction;

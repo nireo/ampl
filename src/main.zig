@@ -19,6 +19,7 @@ pub fn main() !void {
 
     var dump_code = false;
     var dump_ast = false;
+    var script_path: ?[]const u8 = null;
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--dump-code") or std.mem.eql(u8, arg, "-dc")) {
             dump_code = true;
@@ -26,6 +27,12 @@ pub fn main() !void {
 
         if (std.mem.eql(u8, arg, "--dump-ast") or std.mem.eql(u8, arg, "-da")) {
             dump_ast = true;
+        }
+
+        if (arg.len > 0 and arg[0] != '-') {
+            if (script_path == null) {
+                script_path = arg;
+            }
         }
     }
 
@@ -35,6 +42,17 @@ pub fn main() !void {
     var values = std.StringHashMapUnmanaged(vm.Value){};
     defer values.deinit(allocator);
 
+    if (script_path) |path| {
+        const source = try std.fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024);
+        defer allocator.free(source);
+
+        const trimmed = std.mem.trim(u8, source, " \t\r\n");
+        if (trimmed.len == 0) return;
+        try handleSource(allocator, stdout, trimmed, dump_code, dump_ast, &var_ctx, &values, false);
+        try stdout.flush();
+        return;
+    }
+
     try stdout.print("ampl repl. enter statements ending with ';'. type :q or :quit to exit.\n", .{});
 
     while (true) {
@@ -42,6 +60,7 @@ pub fn main() !void {
         try stdout.flush();
 
         const line_opt = try stdin.readUntilDelimiterOrEofAlloc(allocator, '\n', 4096);
+
         if (line_opt == null) break;
         const line = line_opt.?;
         defer allocator.free(line);
@@ -50,83 +69,89 @@ pub fn main() !void {
         if (trimmed.len == 0) continue;
         if (std.mem.eql(u8, trimmed, ":q") or std.mem.eql(u8, trimmed, ":quit")) break;
 
-        const tokens = parser.lex(allocator, trimmed) catch |err| {
-            try stdout.print("lex error: {s}\n", .{@errorName(err)});
-            continue;
-        };
-        defer allocator.free(tokens);
+        handleSource(allocator, stdout, trimmed, dump_code, dump_ast, &var_ctx, &values, true) catch {};
+    }
+}
 
-        var p = parser.Parser.init(allocator, tokens) catch |err| {
-            try stdout.print("parser init error: {s}\n", .{@errorName(err)});
-            continue;
-        };
-        defer p.deinit();
+fn handleSource(allocator: std.mem.Allocator, stdout: anytype, source: []const u8, dump_code: bool, dump_ast: bool, var_ctx: *assembler.VarContext, values: *std.StringHashMapUnmanaged(vm.Value), emit_results: bool) !void {
+    const tokens = parser.lex(allocator, source) catch |err| {
+        try stdout.print("lex error: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer allocator.free(tokens);
 
-        const stmts = p.parse() catch |err| {
-            try stdout.print("parse error: {s}\n", .{@errorName(err)});
-            continue;
-        };
+    var p = parser.Parser.init(allocator, tokens) catch |err| {
+        try stdout.print("parser init error: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer p.deinit();
+
+    const stmts = p.parse() catch |err| {
+        try stdout.print("parse error: {s}\n", .{@errorName(err)});
+        return;
+    };
         defer {
             for (stmts) |stmt| stmt.deinit(allocator);
             allocator.free(stmts);
         }
 
         if (dump_ast) {
-            try stdout.println("ast:\n", .{});
+            try stdout.print("ast:\n", .{});
             try parser.dumpStatements(stmts, stdout);
-            try stdout.println("\n", .{});
-        }
-
-        var assembler_ctx = assembler.Assembler.initWithContext(allocator, stmts, &var_ctx) catch |err| {
-            try stdout.print("assembler init error: {s}\n", .{@errorName(err)});
-            continue;
-        };
-        defer assembler_ctx.deinit();
-
-        var program = assembler_ctx.compile() catch |err| {
-            try stdout.print("assemble error: {s}\n", .{@errorName(err)});
-            continue;
-        };
-        defer program.deinit(allocator);
-
-        if (dump_code) {
-            try stdout.print("code:\n", .{});
-            try dumpInstructions(program.code, stdout);
             try stdout.print("\n", .{});
         }
 
-        var machine = vm.VM.init(allocator) catch |err| {
-            try stdout.print("vm init error: {s}\n", .{@errorName(err)});
-            continue;
-        };
-        defer machine.deinit();
+    var assembler_ctx = assembler.Assembler.initWithContext(allocator, stmts, var_ctx) catch |err| {
+        try stdout.print("assembler init error: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer assembler_ctx.deinit();
 
-        const pid = machine.spawn(program.toVM(), 0) catch |err| {
-            try stdout.print("vm spawn error: {s}\n", .{@errorName(err)});
-            continue;
-        };
+    var program = assembler_ctx.compile() catch |err| {
+        try stdout.print("assemble error: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer program.deinit(allocator);
 
-        // hydrate registers for known variables
-        const var_names = assembler_ctx.variables();
-        if (machine.processes.items[pid]) |*proc| {
-            for (var_names) |name| {
-                if (assembler_ctx.registerFor(name)) |reg| {
-                    if (values.get(name)) |val| {
-                        proc.regs[reg] = val;
-                    }
+    if (dump_code) {
+        try stdout.print("code:\n", .{});
+        try dumpInstructions(program.code, stdout);
+        try stdout.print("\n", .{});
+    }
+
+    var machine = vm.VM.init(allocator) catch |err| {
+        try stdout.print("vm init error: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer machine.deinit();
+
+    const pid = machine.spawn(program.toVM(), 0) catch |err| {
+        try stdout.print("vm spawn error: {s}\n", .{@errorName(err)});
+        return;
+    };
+
+    // hydrate registers for known variables
+    const var_names = assembler_ctx.variables();
+    if (machine.processes.items[pid]) |*proc| {
+        for (var_names) |name| {
+            if (assembler_ctx.registerFor(name)) |reg| {
+                if (values.get(name)) |val| {
+                    proc.regs[reg] = val;
                 }
             }
         }
+    }
 
-        machine.run() catch |err| {
-            try stdout.print("vm run error: {s}\n", .{@errorName(err)});
-            continue;
-        };
+    machine.run() catch |err| {
+        try stdout.print("vm run error: {s}\n", .{@errorName(err)});
+        return;
+    };
 
+    if (emit_results) {
         if (assembler_ctx.lastExprRegister()) |last_reg| {
             const value = machine.readRegister(pid, last_reg) catch |err| {
                 try stdout.print("(result read error: {s})\n", .{@errorName(err)});
-                continue;
+                return;
             };
             try stdout.print("= ", .{});
             try value.print(&machine.heap, stdout);
