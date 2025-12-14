@@ -73,7 +73,16 @@ pub fn main() !void {
     }
 }
 
-fn handleSource(allocator: std.mem.Allocator, stdout: anytype, source: []const u8, dump_code: bool, dump_ast: bool, var_ctx: *assembler.VarContext, values: *std.StringHashMapUnmanaged(vm.Value), emit_results: bool) !void {
+fn handleSource(
+    allocator: std.mem.Allocator,
+    stdout: anytype,
+    source: []const u8,
+    dump_code: bool,
+    dump_ast: bool,
+    var_ctx: *assembler.VarContext,
+    values: *std.StringHashMapUnmanaged(vm.Value),
+    emit_results: bool,
+) !void {
     const tokens = parser.lex(allocator, source) catch |err| {
         try stdout.print("lex error: {s}\n", .{@errorName(err)});
         return;
@@ -90,16 +99,16 @@ fn handleSource(allocator: std.mem.Allocator, stdout: anytype, source: []const u
         try stdout.print("parse error: {s}\n", .{@errorName(err)});
         return;
     };
-        defer {
-            for (stmts) |stmt| stmt.deinit(allocator);
-            allocator.free(stmts);
-        }
+    defer {
+        for (stmts) |stmt| stmt.deinit(allocator);
+        allocator.free(stmts);
+    }
 
-        if (dump_ast) {
-            try stdout.print("ast:\n", .{});
-            try parser.dumpStatements(stmts, stdout);
-            try stdout.print("\n", .{});
-        }
+    if (dump_ast) {
+        try stdout.print("ast:\n", .{});
+        try parser.dumpStatements(stmts, stdout);
+        try stdout.print("\n", .{});
+    }
 
     var assembler_ctx = assembler.Assembler.initWithContext(allocator, stmts, var_ctx) catch |err| {
         try stdout.print("assembler init error: {s}\n", .{@errorName(err)});

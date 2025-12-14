@@ -1,6 +1,8 @@
 const std = @import("std");
 
 const HeapHandle = u32;
+/// MAX_REGS defines the highest register index encodable in an instruction.
+pub const MAX_REGS = 256;
 
 pub const ValueTag = enum {
     int,
@@ -35,9 +37,25 @@ pub const Value = union(ValueTag) {
     }
 };
 
+pub const FunctionLayout = struct {
+    start_ip: usize,
+    register_count: usize,
+};
+
 pub const Program = struct {
     code: []const Instr,
     strings: []const []const u8,
+    register_count: usize = MAX_REGS,
+    functions: []const FunctionLayout = &[_]FunctionLayout{},
+
+    /// registerCountFor returns the register count for a function starting at the
+    /// provided instruction pointer.
+    pub fn registerCountFor(self: Program, start_ip: usize) usize {
+        for (self.functions) |layout| {
+            if (layout.start_ip == start_ip) return layout.register_count;
+        }
+        return self.register_count;
+    }
 };
 
 const HeapObjectTag = enum {
@@ -157,7 +175,8 @@ const Message = struct {
 };
 
 const Frame = struct {
-    regs: [MAX_REGS]Value,
+    regs: []Value,
+    reg_count: usize,
     cond_code: u8,
     return_ip: usize,
     return_dest: u8,
@@ -206,8 +225,6 @@ fn debugInstructions(code: []const Instr) void {
     }
 }
 
-/// MAX_REGS describes the amount of registers that a process should have.
-const MAX_REGS = 256;
 
 /// Number of instructions a process may execute before it is preempted and
 /// returned to the run queue. This is done such that we don't really want to
@@ -230,7 +247,8 @@ const ProcessStatus = enum {
 /// be used to receive information from other processes.
 const Process = struct {
     id: usize,
-    regs: [MAX_REGS]Value,
+    regs: []Value,
+    reg_count: usize,
     cond_code: u8,
     ip: usize,
     program: Program,
@@ -260,6 +278,11 @@ pub const VM = struct {
         // deinit each process
         for (vm.processes.items) |*maybe_proc| {
             if (maybe_proc.*) |*proc| {
+                for (proc.frames.items) |frame| {
+                    vm.allocator.free(frame.regs);
+                }
+
+                vm.allocator.free(proc.regs);
                 proc.mailbox.deinit(vm.allocator);
                 proc.frames.deinit(vm.allocator);
             }
@@ -289,11 +312,18 @@ pub const VM = struct {
 
         if (start_ip >= program.code.len) return error.InvalidStartIp;
 
+        const reg_count: usize = @max(program.register_count, @as(usize, 1));
+        const regs = try vm.allocator.alloc(Value, reg_count);
+        errdefer vm.allocator.free(regs);
+
+        for (regs) |*r| r.* = Value{ .unit = {} };
+
         // basic process init & run queue append
         const mailbox = std.ArrayList(Message).empty;
-        var proc = Process{
+        const proc = Process{
             .id = pid,
-            .regs = undefined,
+            .regs = regs,
+            .reg_count = reg_count,
             .cond_code = 0,
             .ip = start_ip,
             .program = program,
@@ -301,9 +331,6 @@ pub const VM = struct {
             .frames = std.ArrayList(Frame).empty,
             .status = .ready,
         };
-
-        // zero registers
-        for (&proc.regs) |*r| r.* = Value{ .unit = {} };
 
         vm.processes.items[pid] = proc;
         try vm.run_queue.append(vm.allocator, pid);
@@ -465,37 +492,47 @@ pub const VM = struct {
                 const target_ip = instr.a;
                 const arg_start = @as(usize, instr.b);
                 const arg_count = @as(usize, instr.c);
-                if (arg_start + arg_count > MAX_REGS) return error.InvalidCallArgs;
+                if (arg_start + arg_count > proc.reg_count) return error.InvalidCallArgs;
 
                 const frame = Frame{
                     .regs = proc.regs,
+                    .reg_count = proc.reg_count,
                     .cond_code = proc.cond_code,
                     .return_ip = proc.ip + 1,
                     .return_dest = instr.b,
                 };
                 try proc.frames.append(vm.allocator, frame);
 
-                var new_regs: [MAX_REGS]Value = undefined;
-                for (&new_regs) |*r| r.* = Value{ .unit = {} };
+                const new_reg_count = @max(proc.program.registerCountFor(target_ip), @as(usize, 1));
+                var new_regs = try vm.allocator.alloc(Value, new_reg_count);
+                errdefer vm.allocator.free(new_regs);
+
+                for (new_regs) |*r| r.* = Value{ .unit = {} };
 
                 var i: usize = 0;
                 while (i < arg_count) : (i += 1) {
+                    if (i >= new_reg_count) return error.InvalidCallArgs;
                     new_regs[i] = frame.regs[arg_start + i];
                 }
 
                 proc.regs = new_regs;
+                proc.reg_count = new_reg_count;
                 proc.cond_code = 0;
                 proc.ip = target_ip;
             },
             .ret => {
                 const ret_val = proc.regs[instr.a];
+                const callee_regs = proc.regs;
                 if (proc.frames.items.len == 0) {
                     proc.status = .dead;
+                    vm.allocator.free(callee_regs);
                     return;
                 }
 
                 const frame = proc.frames.pop() orelse unreachable;
+                vm.allocator.free(callee_regs);
                 proc.regs = frame.regs;
+                proc.reg_count = frame.reg_count;
                 proc.cond_code = frame.cond_code;
                 proc.ip = frame.return_ip;
                 proc.regs[frame.return_dest] = ret_val;
@@ -593,7 +630,7 @@ pub const VM = struct {
     pub fn readRegister(vm: *VM, pid: usize, reg: usize) !Value {
         if (pid >= vm.processes.items.len) return error.NoSuchPid;
         const proc = vm.processes.items[pid] orelse return error.NoSuchPid;
-        if (reg >= MAX_REGS) return error.InvalidRegister;
+        if (reg >= proc.reg_count) return error.InvalidRegister;
         return proc.regs[reg];
     }
 };

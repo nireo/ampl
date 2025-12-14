@@ -29,7 +29,9 @@ pub const TokenTag = enum {
     l_paren,
     r_paren,
     lt,
+    lteq,
     gt,
+    gteq,
     comma,
     colon,
     semicolon,
@@ -47,6 +49,8 @@ pub const TokenTag = enum {
             .slash => 50,
             .plus => 45,
             .minus => 45,
+            .gteq => 35,
+            .lteq => 35,
             .gt => 35,
             .lt => 35,
             .equal => 1,
@@ -212,12 +216,24 @@ pub fn lex(alloc: std.mem.Allocator, source: []const u8) ![]Token {
                 col += 1;
             },
             '>' => {
-                tag = .gt;
-                col += 1;
+                if (loc + 1 < source.len and source[loc + 1] == '=') {
+                    tag = .gteq;
+                    col += 2;
+                    loc += 1;
+                } else {
+                    tag = .gt;
+                    col += 1;
+                }
             },
             '<' => {
-                tag = .lt;
-                col += 1;
+                if (loc + 1 < source.len and source[loc + 1] == '=') {
+                    tag = .lteq;
+                    col += 2;
+                    loc += 1;
+                } else {
+                    tag = .lt;
+                    col += 1;
+                }
             },
             else => {
                 return LexerError.UnrecognizedChar;
@@ -586,6 +602,8 @@ pub const Parser = struct {
                     return expr;
                 } else {
                     const expr = try self.alloc.create(Expr);
+                    errdefer self.alloc.destroy(expr);
+
                     expr.* = .{
                         .identifier = tok.lexeme,
                     };
@@ -1025,6 +1043,29 @@ test "if statement parsing correct" {
     const else_ret_value = else_ret.ret.value.?;
     try testing.expect(else_ret_value.* == .number);
     try testing.expect(else_ret_value.number == 0);
+}
+
+test "if statement supports lteq operator" {
+    const content = "if (n <= 1) { ret n; }";
+    const tokens = try lex(std.testing.allocator, content);
+    defer testing.allocator.free(tokens);
+
+    var parser = try Parser.init(std.testing.allocator, tokens);
+    defer parser.deinit();
+
+    const stmts = try parser.parse();
+    defer {
+        for (stmts) |stmt| {
+            stmt.deinit(std.testing.allocator);
+        }
+        std.testing.allocator.free(stmts);
+    }
+
+    try testing.expectEqual(@as(usize, 1), stmts.len);
+    const if_stmt = stmts[0];
+    try testing.expect(if_stmt.* == .if_stmt);
+    try testing.expect(if_stmt.if_stmt.expr.* == .binary);
+    try testing.expect(if_stmt.if_stmt.expr.binary.operator == .lteq);
 }
 
 test "lex comments" {

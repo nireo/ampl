@@ -49,11 +49,15 @@ pub const VarContext = struct {
 pub const Program = struct {
     code: []vm.Instr,
     strings: [][]const u8,
+    register_count: usize = vm.MAX_REGS,
+    functions: []vm.FunctionLayout,
 
     pub fn toVM(self: *const Program) vm.Program {
         return .{
             .code = self.code,
             .strings = self.strings,
+            .register_count = self.register_count,
+            .functions = self.functions,
         };
     }
 
@@ -63,6 +67,7 @@ pub const Program = struct {
             alloc.free(@constCast(s));
         }
         alloc.free(self.strings);
+        alloc.free(self.functions);
     }
 };
 
@@ -85,6 +90,7 @@ pub const Assembler = struct {
     const FunctionInfo = struct {
         stmt: *parser.Statement,
         start_ip: ?u8 = null,
+        reg_count: u8 = 0,
     };
 
     const CallFixup = struct {
@@ -185,14 +191,29 @@ pub const Assembler = struct {
         try self.compileFunctions();
         try self.patchCallTargets();
 
+        var fn_layouts = try std.ArrayList(vm.FunctionLayout).initCapacity(self.alloc, self.function_order.items.len);
+        defer fn_layouts.deinit(self.alloc);
+
+        for (self.function_order.items) |name| {
+            const info = self.functions.get(name) orelse return AssembleError.UnknownFunction;
+            const start_ip: usize = @intCast(info.start_ip orelse return AssembleError.UnknownFunction);
+            try fn_layouts.append(self.alloc, .{
+                .start_ip = start_ip,
+                .register_count = @intCast(info.reg_count),
+            });
+        }
+
         const code = try self.instr.toOwnedSlice(self.alloc);
         self.instructions_moved = true;
         const strings = try self.string_pool.toOwnedSlice(self.alloc);
         self.strings_moved = true;
+        const functions = try fn_layouts.toOwnedSlice(self.alloc);
 
         return Program{
             .code = code,
             .strings = strings,
+            .register_count = @intCast(self.var_ctx.next_reg),
+            .functions = functions,
         };
     }
 
@@ -211,7 +232,7 @@ pub const Assembler = struct {
         for (self.function_order.items) |name| {
             var info = self.functions.getPtr(name) orelse unreachable;
             info.start_ip = @intCast(self.instr.items.len);
-            try self.compileFunction(info.stmt);
+            try self.compileFunction(info);
         }
     }
 
@@ -223,8 +244,8 @@ pub const Assembler = struct {
         }
     }
 
-    fn compileFunction(self: *Assembler, stmt: *parser.Statement) AssembleError!void {
-        const fn_def = &stmt.fn_def;
+    fn compileFunction(self: *Assembler, info: *FunctionInfo) AssembleError!void {
+        const fn_def = &info.stmt.fn_def;
         var fn_ctx = try VarContext.init(self.alloc);
         defer fn_ctx.deinit();
 
@@ -252,6 +273,8 @@ pub const Assembler = struct {
         if (self.instr.items.len == 0 or self.instr.items[self.instr.items.len - 1].op != .ret) {
             try self.instr.append(self.alloc, .{ .op = .ret, .a = 0, .b = 0, .c = 0 });
         }
+
+        info.reg_count = fn_ctx.next_reg;
     }
 
     fn compileStatement(self: *Assembler, stmt: *parser.Statement) AssembleError!void {
@@ -382,6 +405,9 @@ pub const Assembler = struct {
             .plus => vm.Op.add,
             .minus => vm.Op.sub,
             .lt => vm.Op.lt,
+            .gt => vm.Op.gt,
+            .lteq => vm.Op.lteq,
+            .gteq => vm.Op.gteq,
             else => return AssembleError.UnsupportedOperator,
         };
 
