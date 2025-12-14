@@ -175,7 +175,7 @@ const Message = struct {
 };
 
 const Frame = struct {
-    regs: []Value,
+    reg_base: usize,
     reg_count: usize,
     cond_code: u8,
     return_ip: usize,
@@ -225,11 +225,10 @@ fn debugInstructions(code: []const Instr) void {
     }
 }
 
-
 /// Number of instructions a process may execute before it is preempted and
 /// returned to the run queue. This is done such that we don't really want to
 /// return a process to the run queue after for example executing one add instruction.
-const REDUCTIONS_PER_SLICE: usize = 100;
+const REDUCTIONS_PER_SLICE: usize = 300;
 
 /// A process can ultimately be in a just a few states.
 /// - ready to compute something
@@ -248,7 +247,9 @@ const ProcessStatus = enum {
 const Process = struct {
     id: usize,
     regs: []Value,
+    reg_base: usize,
     reg_count: usize,
+    reg_stack: std.ArrayList(Value),
     cond_code: u8,
     ip: usize,
     program: Program,
@@ -278,11 +279,7 @@ pub const VM = struct {
         // deinit each process
         for (vm.processes.items) |*maybe_proc| {
             if (maybe_proc.*) |*proc| {
-                for (proc.frames.items) |frame| {
-                    vm.allocator.free(frame.regs);
-                }
-
-                vm.allocator.free(proc.regs);
+                proc.reg_stack.deinit(vm.allocator);
                 proc.mailbox.deinit(vm.allocator);
                 proc.frames.deinit(vm.allocator);
             }
@@ -313,17 +310,19 @@ pub const VM = struct {
         if (start_ip >= program.code.len) return error.InvalidStartIp;
 
         const reg_count: usize = @max(program.register_count, @as(usize, 1));
-        const regs = try vm.allocator.alloc(Value, reg_count);
-        errdefer vm.allocator.free(regs);
-
-        for (regs) |*r| r.* = Value{ .unit = {} };
+        var reg_stack = try std.ArrayList(Value).initCapacity(vm.allocator, reg_count);
+        errdefer reg_stack.deinit(vm.allocator);
+        try reg_stack.resize(vm.allocator, reg_count);
+        for (reg_stack.items) |*r| r.* = Value{ .unit = {} };
 
         // basic process init & run queue append
         const mailbox = std.ArrayList(Message).empty;
         const proc = Process{
             .id = pid,
-            .regs = regs,
+            .regs = reg_stack.items,
+            .reg_base = 0,
             .reg_count = reg_count,
+            .reg_stack = reg_stack,
             .cond_code = 0,
             .ip = start_ip,
             .program = program,
@@ -494,9 +493,12 @@ pub const VM = struct {
                 const arg_count = @as(usize, instr.c);
                 if (arg_start + arg_count > proc.reg_count) return error.InvalidCallArgs;
 
+                const caller_base = proc.reg_base;
+                const caller_reg_count = proc.reg_count;
+
                 const frame = Frame{
-                    .regs = proc.regs,
-                    .reg_count = proc.reg_count,
+                    .reg_base = caller_base,
+                    .reg_count = caller_reg_count,
                     .cond_code = proc.cond_code,
                     .return_ip = proc.ip + 1,
                     .return_dest = instr.b,
@@ -504,35 +506,42 @@ pub const VM = struct {
                 try proc.frames.append(vm.allocator, frame);
 
                 const new_reg_count = @max(proc.program.registerCountFor(target_ip), @as(usize, 1));
-                var new_regs = try vm.allocator.alloc(Value, new_reg_count);
-                errdefer vm.allocator.free(new_regs);
-
+                const new_base = proc.reg_base + proc.reg_count;
+                const needed_len = new_base + new_reg_count;
+                if (needed_len > proc.reg_stack.items.len) {
+                    try proc.reg_stack.resize(vm.allocator, needed_len);
+                }
+                const caller_regs = proc.reg_stack.items[caller_base .. caller_base + caller_reg_count];
+                const new_regs = proc.reg_stack.items[new_base..needed_len];
                 for (new_regs) |*r| r.* = Value{ .unit = {} };
 
                 var i: usize = 0;
                 while (i < arg_count) : (i += 1) {
                     if (i >= new_reg_count) return error.InvalidCallArgs;
-                    new_regs[i] = frame.regs[arg_start + i];
+                    new_regs[i] = caller_regs[arg_start + i];
                 }
 
                 proc.regs = new_regs;
+                proc.reg_base = new_base;
                 proc.reg_count = new_reg_count;
                 proc.cond_code = 0;
                 proc.ip = target_ip;
             },
             .ret => {
                 const ret_val = proc.regs[instr.a];
-                const callee_regs = proc.regs;
                 if (proc.frames.items.len == 0) {
                     proc.status = .dead;
-                    vm.allocator.free(callee_regs);
                     return;
                 }
 
                 const frame = proc.frames.pop() orelse unreachable;
-                vm.allocator.free(callee_regs);
-                proc.regs = frame.regs;
+                const shrink_len = frame.reg_base + frame.reg_count;
+                if (proc.reg_stack.items.len > shrink_len) {
+                    proc.reg_stack.shrinkRetainingCapacity(shrink_len);
+                }
+                proc.reg_base = frame.reg_base;
                 proc.reg_count = frame.reg_count;
+                proc.regs = proc.reg_stack.items[frame.reg_base..shrink_len];
                 proc.cond_code = frame.cond_code;
                 proc.ip = frame.return_ip;
                 proc.regs[frame.return_dest] = ret_val;
@@ -602,7 +611,12 @@ pub const VM = struct {
             if (maybe_proc) |proc| {
                 for (proc.regs) |v| markValue(vm, v);
                 for (proc.frames.items) |frame| {
-                    for (frame.regs) |v| markValue(vm, v);
+                    const frame_end = frame.reg_base + frame.reg_count;
+                    if (frame_end <= proc.reg_stack.items.len) {
+                        for (proc.reg_stack.items[frame.reg_base..frame_end]) |v| {
+                            markValue(vm, v);
+                        }
+                    }
                 }
                 for (proc.mailbox.items) |msg| {
                     markValue(vm, msg.payload);
