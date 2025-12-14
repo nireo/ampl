@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const HeapHandle = u32;
+
 /// MAX_REGS defines the highest register index encodable in an instruction.
 pub const MAX_REGS = 256;
 

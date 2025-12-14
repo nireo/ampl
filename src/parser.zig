@@ -24,6 +24,7 @@ pub const TokenTag = enum {
     keyword_if,
     keyword_ret,
     keyword_else,
+    atom,
     l_brace,
     r_brace,
     l_paren,
@@ -92,10 +93,11 @@ pub fn lex(alloc: std.mem.Allocator, source: []const u8) ![]Token {
                 loc += 1;
             }
 
-            const content = source[start..loc];
+            var content = source[start..loc];
             var tag: TokenTag = .identifier;
             if (keywords.get(content)) |ktag| {
                 tag = ktag;
+                content = "";
             }
 
             try tokens.append(alloc, Token{
@@ -183,8 +185,28 @@ pub fn lex(alloc: std.mem.Allocator, source: []const u8) ![]Token {
                 col += 1;
             },
             ':' => {
-                tag = .colon;
-                col += 1;
+                // there could also be an atom here
+                if (loc + 1 < source.len and std.ascii.isAlphabetic(source[loc + 1])) {
+                    const start = loc + 1;
+                    loc += 2;
+
+                    while (loc < source.len and std.ascii.isAlphabetic(source[loc])) {
+                        loc += 1;
+                    }
+
+                    const content = source[start..loc];
+                    try tokens.append(alloc, Token{
+                        .column = col,
+                        .line = line,
+                        .lexeme = content,
+                        .tag = .atom,
+                    });
+                    col += loc - start + 1; // include the colon
+                    continue;
+                } else {
+                    tag = .colon;
+                    col += 1;
+                }
             },
             ';' => {
                 tag = .semicolon;
@@ -278,6 +300,7 @@ pub const ExprTag = enum {
     binary,
     assign,
     function_call,
+    atom,
 };
 
 pub const Expr = union(ExprTag) {
@@ -297,6 +320,7 @@ pub const Expr = union(ExprTag) {
         name: []const u8,
         args: []*Expr,
     },
+    atom: []const u8,
 
     pub fn deinit(self: *Expr, alloc: std.mem.Allocator) void {
         switch (self.*) {
@@ -304,12 +328,8 @@ pub const Expr = union(ExprTag) {
                 self.binary.left.deinit(alloc);
                 self.binary.right.deinit(alloc);
             },
-            .assign => {
-                self.assign.value.deinit(alloc);
-            },
-            .string => {
-                alloc.free(self.string);
-            },
+            .assign => self.assign.value.deinit(alloc),
+            .string => alloc.free(self.string),
             .function_call => {
                 for (self.function_call.args) |arg| {
                     arg.deinit(alloc);
@@ -327,15 +347,9 @@ pub const Expr = union(ExprTag) {
         }
 
         switch (self.*) {
-            .number => {
-                try writer.print("number: {d}\n", .{self.number});
-            },
-            .identifier => {
-                try writer.print("identifier: {s}\n", .{self.identifier});
-            },
-            .string => {
-                try writer.print("string: \"{s}\"\n", .{self.string});
-            },
+            .number => try writer.print("number: {d}\n", .{self.number}),
+            .identifier => try writer.print("identifier: {s}\n", .{self.identifier}),
+            .string => try writer.print("string: \"{s}\"\n", .{self.string}),
             .binary => {
                 try writer.print("binary operator: {s}\n", .{@tagName(self.binary.operator)});
                 try self.binary.left.dump(writer, indent + 1);
@@ -351,6 +365,7 @@ pub const Expr = union(ExprTag) {
                     try arg.dump(writer, indent + 1);
                 }
             },
+            .atom => try writer.print("atom: :{s}\n", .{self.atom}),
         }
     }
 };
@@ -560,6 +575,14 @@ pub const Parser = struct {
                 const expr = try self.alloc.create(Expr);
                 expr.* = .{
                     .number = value,
+                };
+                return expr;
+            },
+            .atom => {
+                _ = self.advance();
+                const expr = try self.alloc.create(Expr);
+                expr.* = .{
+                    .atom = tok.lexeme,
                 };
                 return expr;
             },
@@ -1201,4 +1224,43 @@ test "statement dump includes branches" {
         "if statement:\n  binary operator: lt\n    identifier: x\n    number: 10\n  block:\n    return statement:\n      identifier: x\n  block:\n    return statement:\n      number: 0\n",
         dumped,
     );
+}
+
+test "lex atom" {
+    const content = ":atom + :another";
+    const tokens = try lex(std.testing.allocator, content);
+    defer testing.allocator.free(tokens);
+
+    try testing.expect(tokens.len == 4);
+    try testing.expect(tokens[0].tag == .atom);
+    try testing.expect(std.mem.eql(u8, tokens[0].lexeme, "atom"));
+
+    try testing.expect(tokens[1].tag == .plus);
+    try testing.expect(tokens[2].tag == .atom);
+    try testing.expect(std.mem.eql(u8, tokens[2].lexeme, "another"));
+}
+
+test "parse atom" {
+    const content = ":atom;";
+    const tokens = try lex(std.testing.allocator, content);
+    defer testing.allocator.free(tokens);
+
+    var parser = try Parser.init(std.testing.allocator, tokens);
+    defer parser.deinit();
+
+    const stmts = try parser.parse();
+    defer {
+        for (stmts) |stmt| {
+            stmt.deinit(std.testing.allocator);
+        }
+        std.testing.allocator.free(stmts);
+    }
+
+    try testing.expectEqual(@as(usize, 1), stmts.len);
+    const expr_stmt = stmts[0];
+    try testing.expect(expr_stmt.* == .expression);
+
+    const atom_expr = expr_stmt.expression.expr;
+    try testing.expect(atom_expr.* == .atom);
+    try testing.expect(std.mem.eql(u8, atom_expr.atom, "atom"));
 }
