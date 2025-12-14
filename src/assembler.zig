@@ -85,6 +85,7 @@ pub const Assembler = struct {
     functions: std.StringHashMap(FunctionInfo),
     function_order: std.ArrayList([]const u8),
     call_fixups: std.ArrayList(CallFixup),
+    spawn_fixups: std.ArrayList(CallFixup),
 
     /// FunctionInfo contains the parsed structure of the function and the instruction where it starts
     const FunctionInfo = struct {
@@ -117,6 +118,7 @@ pub const Assembler = struct {
             .functions = std.StringHashMap(FunctionInfo).init(alloc),
             .function_order = try std.ArrayList([]const u8).initCapacity(alloc, 0),
             .call_fixups = try std.ArrayList(CallFixup).initCapacity(alloc, 0),
+            .spawn_fixups = try std.ArrayList(CallFixup).initCapacity(alloc, 0),
         };
     }
 
@@ -137,6 +139,7 @@ pub const Assembler = struct {
             .functions = std.StringHashMap(FunctionInfo).init(alloc),
             .function_order = try std.ArrayList([]const u8).initCapacity(alloc, 0),
             .call_fixups = try std.ArrayList(CallFixup).initCapacity(alloc, 0),
+            .spawn_fixups = try std.ArrayList(CallFixup).initCapacity(alloc, 0),
         };
     }
 
@@ -155,6 +158,7 @@ pub const Assembler = struct {
         self.functions.deinit();
         self.function_order.deinit(self.alloc);
         self.call_fixups.deinit(self.alloc);
+        self.spawn_fixups.deinit(self.alloc);
         if (!self.strings_moved) {
             for (self.string_pool.items) |s| self.alloc.free(@constCast(s));
             self.string_pool.deinit(self.alloc);
@@ -174,6 +178,7 @@ pub const Assembler = struct {
         self.functions.clearRetainingCapacity();
         self.function_order.clearRetainingCapacity();
         self.call_fixups.clearRetainingCapacity();
+        self.spawn_fixups.clearRetainingCapacity();
         for (self.string_pool.items) |s| self.alloc.free(@constCast(s));
         self.string_pool.clearRetainingCapacity();
         try self.functions.ensureTotalCapacity(4);
@@ -190,6 +195,7 @@ pub const Assembler = struct {
 
         try self.compileFunctions();
         try self.patchCallTargets();
+        try self.patchSpawnTargets();
 
         var fn_layouts = try std.ArrayList(vm.FunctionLayout).initCapacity(self.alloc, self.function_order.items.len);
         defer fn_layouts.deinit(self.alloc);
@@ -241,6 +247,14 @@ pub const Assembler = struct {
             const info = self.functions.get(fixup.name) orelse return AssembleError.UnknownFunction;
             const target = info.start_ip orelse return AssembleError.UnknownFunction;
             self.instr.items[fixup.instr_idx].a = target;
+        }
+    }
+
+    fn patchSpawnTargets(self: *Assembler) AssembleError!void {
+        for (self.spawn_fixups.items) |fixup| {
+            const info = self.functions.get(fixup.name) orelse return AssembleError.UnknownFunction;
+            const target = info.start_ip orelse return AssembleError.UnknownFunction;
+            self.instr.items[fixup.instr_idx].b = target;
         }
     }
 
@@ -419,9 +433,17 @@ pub const Assembler = struct {
     /// this can't be implemented using the code itself, as it uses the internal mailbox. it takes in the
     /// arguments just to validate that they're isn't any to keep the other functions clean
     fn compileRecv(self: *Assembler, args: []*parser.Expr) AssembleError!u8 {
-        if (args.len != 0) return AssembleError.WrongAmountOfArguments;
+        if (args.len > 1) return AssembleError.WrongAmountOfArguments;
         const dest_reg = try self.allocateRegister();
-        try self.instr.append(self.alloc, .{ .op = .recv, .a = dest_reg, .b = dest_reg, .c = 0 });
+        var sender_reg = dest_reg;
+
+        if (args.len == 1) {
+            const arg = args[0];
+            if (arg.* != .identifier) return AssembleError.UnsupportedExpression;
+            sender_reg = try self.getOrCreateRegister(arg.identifier);
+        }
+
+        try self.instr.append(self.alloc, .{ .op = .recv, .a = dest_reg, .b = sender_reg, .c = 0 });
         return dest_reg;
     }
 
@@ -456,6 +478,33 @@ pub const Assembler = struct {
         if (std.mem.eql(u8, "recv", name)) return try self.compileRecv(args);
         if (std.mem.eql(u8, "send", name)) return try self.compileSend(args);
         if (std.mem.eql(u8, "print", name)) return try self.compilePrint(args);
+        if (std.mem.eql(u8, "self", name)) {
+            if (args.len != 0) return AssembleError.WrongAmountOfArguments;
+            const dest = try self.allocateRegister();
+            try self.instr.append(self.alloc, .{ .op = .self, .a = dest, .b = 0, .c = 0 });
+            return dest;
+        }
+        if (std.mem.eql(u8, "spawn", name)) {
+            if (args.len != 1) return AssembleError.WrongAmountOfArguments;
+            const arg = args[0];
+            if (arg.* != .identifier) return AssembleError.UnsupportedExpression;
+            const fn_name = arg.identifier;
+            const info = self.functions.get(fn_name) orelse return AssembleError.UnknownFunction;
+
+            const dest_reg = try self.allocateRegister();
+            const instr_idx = self.instr.items.len;
+            const child_ip: u8 = if (info.start_ip) |ip| ip else 0;
+            try self.instr.append(self.alloc, .{ .op = .spawn, .a = dest_reg, .b = child_ip, .c = 0 });
+
+            if (info.start_ip == null) {
+                try self.spawn_fixups.append(self.alloc, .{
+                    .instr_idx = instr_idx,
+                    .name = fn_name,
+                });
+            }
+
+            return dest_reg;
+        }
 
         // check if the function exists
         if (!self.functions.contains(name)) return AssembleError.UnknownFunction;

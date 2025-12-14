@@ -92,11 +92,10 @@ pub fn lex(alloc: std.mem.Allocator, source: []const u8) ![]Token {
                 loc += 1;
             }
 
-            var content = source[start..loc];
+            const content = source[start..loc];
             var tag: TokenTag = .identifier;
             if (keywords.get(content)) |ktag| {
                 tag = ktag;
-                content = ""; // no need to store the lexeme
             }
 
             try tokens.append(alloc, Token{
@@ -572,7 +571,7 @@ pub const Parser = struct {
                 expr.* = .{ .string = duped };
                 return expr;
             },
-            .identifier => {
+            .identifier, .keyword_spawn => {
                 _ = self.advance();
                 if (self.peek().tag == .l_paren) {
                     _ = self.advance(); // consume '('

@@ -6,4 +6,4 @@ def fib(n) {
     }
 }
 
-print(fib(40));
+print(fib(20));
