@@ -46,6 +46,44 @@ pub const VarContext = struct {
     }
 };
 
+pub const AtomStore = struct {
+    map: std.StringHashMap(u16),
+    alloc: std.mem.Allocator,
+    running_id: u16,
+
+    pub fn init(alloc: std.mem.Allocator) !AtomStore {
+        return AtomStore{
+            .map = std.StringHashMap(u16).init(alloc),
+            .alloc = alloc,
+            .running_id = 0,
+        };
+    }
+
+    pub fn getOrInsert(self: *AtomStore, atom: []const u8) !u16 {
+        const entry = try self.map.getOrPutValue(atom, self.running_id);
+        if (entry.value_ptr.* == self.running_id) {
+            self.running_id += 1;
+        }
+
+        return entry.value_ptr.*;
+    }
+
+    /// inverse returns a hashmap with the values turned around. this returns a map for the vm such it can
+    /// properly print atom values based on the id. this frees the internal map and it's the caller's responsibility
+    /// to free the resulting map.
+    pub fn inverse(self: *AtomStore) !std.AutoHashMap(u16, []const u8) {
+        var inversed = std.AutoHashMap(u16, []const u8).init(self.alloc);
+        defer self.map.deinit(); // if this function fails the whole thing goes to shit so just free it.
+
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            try inversed.put(entry.value_ptr.*, entry.key_ptr.*);
+        }
+
+        return inversed;
+    }
+};
+
 pub const Program = struct {
     code: []vm.Instr,
     strings: [][]const u8,
@@ -86,6 +124,7 @@ pub const Assembler = struct {
     function_order: std.ArrayList([]const u8),
     call_fixups: std.ArrayList(CallFixup),
     spawn_fixups: std.ArrayList(CallFixup),
+    atom_store: AtomStore,
 
     /// FunctionInfo contains the parsed structure of the function and the instruction where it starts
     const FunctionInfo = struct {
@@ -119,6 +158,7 @@ pub const Assembler = struct {
             .function_order = try std.ArrayList([]const u8).initCapacity(alloc, 0),
             .call_fixups = try std.ArrayList(CallFixup).initCapacity(alloc, 0),
             .spawn_fixups = try std.ArrayList(CallFixup).initCapacity(alloc, 0),
+            .atom_store = try AtomStore.init(alloc),
         };
     }
 
@@ -140,6 +180,7 @@ pub const Assembler = struct {
             .function_order = try std.ArrayList([]const u8).initCapacity(alloc, 0),
             .call_fixups = try std.ArrayList(CallFixup).initCapacity(alloc, 0),
             .spawn_fixups = try std.ArrayList(CallFixup).initCapacity(alloc, 0),
+            .atom_store = try AtomStore.init(alloc),
         };
     }
 
@@ -312,6 +353,16 @@ pub const Assembler = struct {
         }
     }
 
+    fn compileAtom(self: *Assembler, atom: []const u8) AssembleError!u8 {
+        const atom_id = try self.atom_store.getOrInsert(atom);
+        const reg = try self.allocateRegister();
+        const b = atom_id >> 8;
+        const c = atom_id & 0x00FF;
+
+        try self.instr.append(self.alloc, .{ .op = vm.Op.atom, .a = reg, .b = @intCast(b), .c = @intCast(c) });
+        return reg;
+    }
+
     fn compileExpr(self: *Assembler, expr: *parser.Expr) AssembleError!u8 {
         return switch (expr.*) {
             .number => try self.loadNumber(expr.number),
@@ -320,6 +371,7 @@ pub const Assembler = struct {
             .assign => try self.compileAssign(expr.assign.name, expr.assign.value),
             .binary => try self.compileBinary(expr.binary.left, expr.binary.operator, expr.binary.right),
             .function_call => try self.compileFunctionCall(expr.function_call.name, expr.function_call.args),
+            .atom => try self.compileAtom(expr.atom),
         };
     }
 
@@ -931,4 +983,22 @@ test "identical string literals are interned once" {
     try testing.expectEqual(vm.Op.str, code[0].op);
     try testing.expectEqual(vm.Op.str, code[2].op);
     try testing.expectEqual(code[0].b, code[2].b); // reused pool index
+}
+
+test "atom store" {
+    var as = try AtomStore.init(testing.allocator);
+    var id = try as.getOrInsert("hello world"); // 0
+    try testing.expectEqual(@as(u16, 0), id);
+
+    id = try as.getOrInsert("foo bar"); // 1
+    try testing.expectEqual(@as(u16, 1), id);
+
+    id = try as.getOrInsert("hello world"); // reused
+    try testing.expectEqual(@as(u16, 0), id);
+
+    var inversed = try as.inverse();
+    defer inversed.deinit();
+
+    try testing.expectEqualStrings("hello world", inversed.get(@as(u16, 0)).?);
+    try testing.expectEqualStrings("foo bar", inversed.get(@as(u16, 1)).?);
 }

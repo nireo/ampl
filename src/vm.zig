@@ -206,6 +206,7 @@ pub const Op = enum(u8) {
     jmp_true,
     jmp_not,
     print,
+    atom,
 };
 
 pub const Instr = struct {
@@ -572,6 +573,11 @@ pub const VM = struct {
                     },
                 }
                 try stdout.flush();
+                proc.ip += 1;
+            },
+            .atom => {
+                const atom_id: u16 = (@as(u16, instr.b) << 8) | instr.c;
+                proc.regs[instr.a] = Value{ .int = @as(i64, atom_id) };
                 proc.ip += 1;
             },
         }
