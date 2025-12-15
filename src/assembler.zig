@@ -46,20 +46,29 @@ pub const VarContext = struct {
     }
 };
 
-pub const AtomStore = struct {
+pub const AtomTable = struct {
     map: std.StringHashMap(u16),
     alloc: std.mem.Allocator,
     running_id: u16,
 
-    pub fn init(alloc: std.mem.Allocator) !AtomStore {
-        return AtomStore{
+    pub fn init(alloc: std.mem.Allocator) !AtomTable {
+        return AtomTable{
             .map = std.StringHashMap(u16).init(alloc),
             .alloc = alloc,
             .running_id = 0,
         };
     }
 
-    pub fn getOrInsert(self: *AtomStore, atom: []const u8) !u16 {
+    pub fn deinit(self: *AtomTable) void {
+        self.map.deinit();
+    }
+
+    pub fn clear(self: *AtomTable) void {
+        self.map.clearRetainingCapacity();
+        self.running_id = 0;
+    }
+
+    pub fn getOrInsert(self: *AtomTable, atom: []const u8) !u16 {
         const entry = try self.map.getOrPutValue(atom, self.running_id);
         if (entry.value_ptr.* == self.running_id) {
             self.running_id += 1;
@@ -69,11 +78,9 @@ pub const AtomStore = struct {
     }
 
     /// inverse returns a hashmap with the values turned around. this returns a map for the vm such it can
-    /// properly print atom values based on the id. this frees the internal map and it's the caller's responsibility
-    /// to free the resulting map.
-    pub fn inverse(self: *AtomStore) !std.AutoHashMap(u16, []const u8) {
+    /// properly print atom values based on the id. the caller must free the resulting map.
+    pub fn inverse(self: *AtomTable) !std.AutoHashMap(u16, []const u8) {
         var inversed = std.AutoHashMap(u16, []const u8).init(self.alloc);
-        defer self.map.deinit(); // if this function fails the whole thing goes to shit so just free it.
 
         var it = self.map.iterator();
         while (it.next()) |entry| {
@@ -82,6 +89,22 @@ pub const AtomStore = struct {
 
         return inversed;
     }
+
+    /// toOwnedSlice returns an array where each atom is stored at the index of
+    /// its id. The returned slice and its contents are allocated using the
+    /// AtomTable allocator and must be freed by the caller.
+    pub fn toOwnedSlice(self: *AtomTable) ![][]const u8 {
+        const slice = try self.alloc.alloc([]const u8, self.running_id);
+        for (slice) |*s| s.* = &[_]u8{};
+
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            const idx: usize = entry.value_ptr.*;
+            slice[idx] = entry.key_ptr.*;
+        }
+
+        return slice;
+    }
 };
 
 pub const Program = struct {
@@ -89,6 +112,7 @@ pub const Program = struct {
     strings: [][]const u8,
     register_count: usize = vm.MAX_REGS,
     functions: []vm.FunctionLayout,
+    atoms: [][]const u8 = &[_][]const u8{},
 
     pub fn toVM(self: *const Program) vm.Program {
         return .{
@@ -96,6 +120,7 @@ pub const Program = struct {
             .strings = self.strings,
             .register_count = self.register_count,
             .functions = self.functions,
+            .atoms = self.atoms,
         };
     }
 
@@ -106,6 +131,7 @@ pub const Program = struct {
         }
         alloc.free(self.strings);
         alloc.free(self.functions);
+        alloc.free(self.atoms);
     }
 };
 
@@ -124,7 +150,7 @@ pub const Assembler = struct {
     function_order: std.ArrayList([]const u8),
     call_fixups: std.ArrayList(CallFixup),
     spawn_fixups: std.ArrayList(CallFixup),
-    atom_store: AtomStore,
+    atom_table: AtomTable,
 
     /// FunctionInfo contains the parsed structure of the function and the instruction where it starts
     const FunctionInfo = struct {
@@ -158,7 +184,7 @@ pub const Assembler = struct {
             .function_order = try std.ArrayList([]const u8).initCapacity(alloc, 0),
             .call_fixups = try std.ArrayList(CallFixup).initCapacity(alloc, 0),
             .spawn_fixups = try std.ArrayList(CallFixup).initCapacity(alloc, 0),
-            .atom_store = try AtomStore.init(alloc),
+            .atom_table = try AtomTable.init(alloc),
         };
     }
 
@@ -180,7 +206,7 @@ pub const Assembler = struct {
             .function_order = try std.ArrayList([]const u8).initCapacity(alloc, 0),
             .call_fixups = try std.ArrayList(CallFixup).initCapacity(alloc, 0),
             .spawn_fixups = try std.ArrayList(CallFixup).initCapacity(alloc, 0),
-            .atom_store = try AtomStore.init(alloc),
+            .atom_table = try AtomTable.init(alloc),
         };
     }
 
@@ -207,6 +233,8 @@ pub const Assembler = struct {
             self.string_pool.deinit(self.alloc);
         }
 
+        self.atom_table.deinit();
+
         if (!self.instructions_moved) {
             self.instr.deinit(self.alloc);
         }
@@ -220,6 +248,7 @@ pub const Assembler = struct {
         self.function_order.clearRetainingCapacity();
         self.call_fixups.clearRetainingCapacity();
         self.spawn_fixups.clearRetainingCapacity();
+        self.atom_table.clear();
         for (self.string_pool.items) |s| self.alloc.free(@constCast(s));
         self.string_pool.clearRetainingCapacity();
         try self.functions.ensureTotalCapacity(4);
@@ -255,12 +284,14 @@ pub const Assembler = struct {
         const strings = try self.string_pool.toOwnedSlice(self.alloc);
         self.strings_moved = true;
         const functions = try fn_layouts.toOwnedSlice(self.alloc);
+        const atoms = try self.atom_table.toOwnedSlice();
 
         return Program{
             .code = code,
             .strings = strings,
             .register_count = @intCast(self.var_ctx.next_reg),
             .functions = functions,
+            .atoms = atoms,
         };
     }
 
@@ -354,7 +385,7 @@ pub const Assembler = struct {
     }
 
     fn compileAtom(self: *Assembler, atom: []const u8) AssembleError!u8 {
-        const atom_id = try self.atom_store.getOrInsert(atom);
+        const atom_id = try self.atom_table.getOrInsert(atom);
         const reg = try self.allocateRegister();
         const b = atom_id >> 8;
         const c = atom_id & 0x00FF;
@@ -985,8 +1016,9 @@ test "identical string literals are interned once" {
     try testing.expectEqual(code[0].b, code[2].b); // reused pool index
 }
 
-test "atom store" {
-    var as = try AtomStore.init(testing.allocator);
+test "atom table" {
+    var as = try AtomTable.init(testing.allocator);
+    defer as.deinit();
     var id = try as.getOrInsert("hello world"); // 0
     try testing.expectEqual(@as(u16, 0), id);
 
@@ -1001,4 +1033,40 @@ test "atom store" {
 
     try testing.expectEqualStrings("hello world", inversed.get(@as(u16, 0)).?);
     try testing.expectEqualStrings("foo bar", inversed.get(@as(u16, 1)).?);
+}
+
+test "atom compiled correctly" {
+    const src = ":hello + :world;"; // atom addition if of course an invalid operation
+    const tokens = try parser.lex(testing.allocator, src);
+    defer testing.allocator.free(tokens);
+
+    var p = try parser.Parser.init(testing.allocator, tokens);
+    defer p.deinit();
+
+    const stmts = try p.parse();
+    defer {
+        for (stmts) |stmt| stmt.deinit(testing.allocator);
+        testing.allocator.free(stmts);
+    }
+
+    var assembler = try Assembler.init(testing.allocator, stmts);
+    defer assembler.deinit();
+
+    var program = try assembler.compile();
+    defer program.deinit(testing.allocator);
+
+    const code = program.code;
+    try testing.expectEqual(vm.Op.atom, code[0].op);
+    try testing.expectEqual(vm.Op.atom, code[1].op);
+    try testing.expectEqual(@as(usize, 2), program.atoms.len);
+    try testing.expectEqualStrings("hello", program.atoms[0]);
+    try testing.expectEqualStrings("world", program.atoms[1]);
+
+    var inversed = try assembler.atom_table.inverse();
+    defer inversed.deinit();
+
+    const atom0 = inversed.get((@as(u16, code[0].b) << 8) | @as(u16, code[0].c)).?;
+    const atom1 = inversed.get((@as(u16, code[1].b) << 8) | @as(u16, code[1].c)).?;
+    try testing.expectEqualStrings("hello", atom0);
+    try testing.expectEqualStrings("world", atom1);
 }

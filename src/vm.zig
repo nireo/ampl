@@ -10,6 +10,7 @@ pub const ValueTag = enum {
     pid,
     unit,
     string,
+    atom,
 };
 
 pub const Value = union(ValueTag) {
@@ -17,8 +18,9 @@ pub const Value = union(ValueTag) {
     pid: usize,
     unit: void,
     string: HeapHandle,
+    atom: u16,
 
-    pub fn print(value: Value, heap: ?*const Heap, writer: anytype) !void {
+    pub fn print(value: Value, heap: ?*const Heap, atoms: ?[]const []const u8, writer: anytype) !void {
         switch (value) {
             .int => |v| try writer.print("{d}", .{v}),
             .pid => |pid| try writer.print("pid({})", .{pid}),
@@ -34,6 +36,15 @@ pub const Value = union(ValueTag) {
                     try writer.print("<string {}>", .{handle});
                 }
             },
+            .atom => |atom_id| {
+                if (atoms) |slice| {
+                    if (atom_id < slice.len) {
+                        try writer.print(":{s}", .{slice[atom_id]});
+                        return;
+                    }
+                }
+                try writer.print(":{}", .{atom_id});
+            },
         }
     }
 };
@@ -48,6 +59,7 @@ pub const Program = struct {
     strings: []const []const u8,
     register_count: usize = MAX_REGS,
     functions: []const FunctionLayout = &[_]FunctionLayout{},
+    atoms: []const []const u8 = &[_][]const u8{},
 
     /// registerCountFor returns the register count for a function starting at the
     /// provided instruction pointer.
@@ -559,25 +571,14 @@ pub const VM = struct {
                 var stdout_buffer: [256]u8 = undefined;
                 var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
                 const stdout = &stdout_writer.interface;
-                const val = proc.regs[instr.a];
-                switch (val) {
-                    .int => |v| try stdout.print("{d}\n", .{v}),
-                    .pid => |pid| try stdout.print("pid({})\n", .{pid}),
-                    .unit => try stdout.print("()\n", .{}),
-                    .string => |handle| {
-                        if (vm.heap.get(handle)) |s| {
-                            try stdout.print("\"{s}\"\n", .{s});
-                        } else {
-                            try stdout.print("<string {}>\n", .{handle});
-                        }
-                    },
-                }
+                try Value.print(proc.regs[instr.a], &vm.heap, proc.program.atoms, stdout);
+                try stdout.print("\n", .{});
                 try stdout.flush();
                 proc.ip += 1;
             },
             .atom => {
                 const atom_id: u16 = (@as(u16, instr.b) << 8) | instr.c;
-                proc.regs[instr.a] = Value{ .int = @as(i64, atom_id) };
+                proc.regs[instr.a] = Value{ .atom = atom_id };
                 proc.ip += 1;
             },
         }
@@ -908,6 +909,54 @@ test "recv captures sender when requested" {
     const receiver = vm.processes.items[recv_pid].?;
     try std.testing.expectEqual(@as(i64, 42), try expectInt(receiver.regs[0]));
     try std.testing.expectEqual(send_pid, try expectPid(receiver.regs[1]));
+}
+
+test "atom instruction produces atom values" {
+    const gpa = std.testing.allocator;
+    var vm = try VM.init(gpa);
+    defer vm.deinit();
+
+    const code = [_]Instr{
+        .{ .op = .atom, .a = 0, .b = 0, .c = 1 }, // :world id 1
+        .{ .op = .atom, .a = 1, .b = 0, .c = 1 },
+        .{ .op = .eq, .a = 0, .b = 1, .c = 0 },
+        .{ .op = .halt, .a = 0, .b = 0, .c = 0 },
+    };
+
+    const program = Program{
+        .code = &code,
+        .strings = &[_][]const u8{},
+        .atoms = &[_][]const u8{ "hello", "world" },
+    };
+
+    const pid = try vm.spawn(program, 0);
+    try vm.run();
+
+    const proc = vm.processes.items[pid].?;
+    try std.testing.expectEqual(Value{ .atom = 1 }, proc.regs[0]);
+    try std.testing.expectEqual(Value{ .atom = 1 }, proc.regs[1]);
+    try std.testing.expectEqual(@as(u8, 1), proc.cond_code);
+}
+
+test "Value.print renders atoms" {
+    var buf = try std.ArrayList(u8).initCapacity(std.testing.allocator, 0);
+    defer buf.deinit(std.testing.allocator);
+
+    const atoms = &[_][]const u8{ "foo", "bar" };
+
+    {
+        buf.clearRetainingCapacity();
+        const writer = buf.writer(std.testing.allocator);
+        try Value.print(Value{ .atom = 1 }, null, atoms, writer);
+        try std.testing.expectEqualStrings(":bar", buf.items);
+    }
+
+    {
+        buf.clearRetainingCapacity();
+        const writer = buf.writer(std.testing.allocator);
+        try Value.print(Value{ .atom = 3 }, null, atoms, writer);
+        try std.testing.expectEqualStrings(":3", buf.items);
+    }
 }
 
 test "self writes current pid" {

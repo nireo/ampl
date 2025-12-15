@@ -163,7 +163,7 @@ fn handleSource(
                 return;
             };
             try stdout.print("= ", .{});
-            try value.print(&machine.heap, stdout);
+            try value.print(&machine.heap, program.atoms, stdout);
             try stdout.print("\n", .{});
         }
 
@@ -180,7 +180,7 @@ fn handleSource(
             };
 
             try stdout.print("{s} = ", .{name});
-            try value.print(&machine.heap, stdout);
+            try value.print(&machine.heap, program.atoms, stdout);
             try stdout.print("\n", .{});
         }
     }
