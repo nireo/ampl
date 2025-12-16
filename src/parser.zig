@@ -24,6 +24,8 @@ pub const TokenTag = enum {
     keyword_if,
     keyword_ret,
     keyword_else,
+    keyword_receive,
+    keyword_after,
     atom,
     l_brace,
     r_brace,
@@ -43,6 +45,7 @@ pub const TokenTag = enum {
     minus,
     slash,
     eof,
+    arrow,
 
     fn precedence(self: TokenTag) !usize {
         return switch (self) {
@@ -75,6 +78,7 @@ const keywords = std.StaticStringMap(TokenTag).initComptime(.{
     .{ "ret", TokenTag.keyword_ret },
     .{ "if", TokenTag.keyword_if },
     .{ "else", TokenTag.keyword_else },
+    .{ "receive", TokenTag.keyword_receive },
 });
 
 pub fn lex(alloc: std.mem.Allocator, source: []const u8) ![]Token {
@@ -221,8 +225,14 @@ pub fn lex(alloc: std.mem.Allocator, source: []const u8) ![]Token {
                 col += 1;
             },
             '-' => {
-                tag = .minus;
-                col += 1;
+                if (loc + 1 < source.len and source[loc + 1] == '>') {
+                    tag = .arrow;
+                    col += 2;
+                    loc += 1;
+                } else {
+                    tag = .minus;
+                    col += 1;
+                }
             },
             '*' => {
                 tag = .asterisk;
@@ -291,6 +301,7 @@ pub const StatementTag = enum {
     ret,
     if_stmt,
     loop,
+    receive,
 };
 
 pub const ExprTag = enum {
@@ -374,6 +385,12 @@ const Param = struct {
     name: []const u8,
 };
 
+const ReceiveArm = struct {
+    atom: []const u8,
+    payload_name: []const u8,
+    stmt: *Statement,
+};
+
 pub const Statement = union(StatementTag) {
     expression: struct {
         expr: *Expr,
@@ -401,6 +418,9 @@ pub const Statement = union(StatementTag) {
     loop: struct {
         cond: ?*Expr,
         body: *Statement,
+    },
+    receive: struct {
+        arms: []ReceiveArm,
     },
 
     pub fn deinit(self: *Statement, alloc: std.mem.Allocator) void {
@@ -441,6 +461,12 @@ pub const Statement = union(StatementTag) {
                     c.deinit(alloc);
                 }
                 self.loop.body.deinit(alloc);
+            },
+            .receive => {
+                for (self.receive.arms) |arm| {
+                    arm.stmt.deinit(alloc);
+                }
+                alloc.free(self.receive.arms);
             },
         }
         alloc.destroy(self);
@@ -492,6 +518,16 @@ pub const Statement = union(StatementTag) {
                     try c.dump(writer, indent + 1);
                 }
                 try self.loop.body.dump(writer, indent + 1);
+            },
+            .receive => {
+                try writer.print("receive statement:\n", .{});
+                for (self.receive.arms) |arm| {
+                    for (0..indent + 1) |_| {
+                        try writer.print("  ", .{});
+                    }
+                    try writer.print("arm: :{s}, {s}\n", .{ arm.atom, arm.payload_name });
+                    try arm.stmt.dump(writer, indent + 2);
+                }
             },
         }
     }
@@ -644,6 +680,53 @@ pub const Parser = struct {
         }
     }
 
+    fn parseReceive(self: *Parser) ParseError!*Statement {
+        try self.expect(.keyword_receive);
+
+        var arms = try std.ArrayList(ReceiveArm).initCapacity(self.alloc, 0);
+        defer arms.deinit(self.alloc);
+
+        try self.expect(.l_brace);
+        while (self.peek().tag != .r_brace) {
+            const tok = self.advance();
+            switch (tok.tag) {
+                .l_brace => {
+                    // {:something, info} -> print(info),
+                    const atom = try self.matchRet(.atom);
+                    try self.expect(.comma);
+
+                    const payload = try self.matchRet(.identifier);
+                    try self.expect(.r_brace);
+                    try self.expect(.arrow);
+
+                    const stmt_body = try self.parseStatement();
+                    errdefer stmt_body.deinit(self.alloc);
+                    _ = self.match(.comma);
+
+                    try arms.append(self.alloc, ReceiveArm{
+                        .atom = atom.lexeme,
+                        .payload_name = payload.lexeme,
+                        .stmt = stmt_body,
+                    });
+                },
+                else => {
+                    return ParseError.InvalidTokenStmt;
+                },
+            }
+        }
+
+        try self.expect(.r_brace);
+        const stmt = try self.alloc.create(Statement);
+        errdefer self.alloc.destroy(stmt);
+
+        stmt.* = .{
+            .receive = .{
+                .arms = try arms.toOwnedSlice(self.alloc),
+            },
+        };
+        return stmt;
+    }
+
     fn parseLoop(self: *Parser) ParseError!*Statement {
         try self.expect(.keyword_loop);
 
@@ -727,6 +810,9 @@ pub const Parser = struct {
                     },
                 };
                 return stmt;
+            },
+            .keyword_receive => {
+                return try self.parseReceive();
             },
             else => {
                 const expr = try self.parseExpression(0);
@@ -822,11 +908,23 @@ pub const Parser = struct {
         return tok;
     }
 
-    fn match(self: *Parser, tag: TokenTag) bool {
+    fn matchRet(self: *Parser, tag: TokenTag) !*const Token {
+        const tok = self.peek();
         if (self.peek().tag == tag) {
+            return self.advance();
+        }
+
+        std.debug.print("{d}:{d} Expected token: {s}, found: {s}\n", .{ tok.line, tok.column, @tagName(tag), @tagName(self.peek().tag) });
+        return ParserError.ExpectedToken;
+    }
+
+    fn match(self: *Parser, tag: TokenTag) bool {
+        const tok = self.peek();
+        if (tok.tag == tag) {
             _ = self.advance();
             return true;
         }
+
         return false;
     }
 
@@ -849,11 +947,11 @@ test "lex numbers" {
 }
 
 test "identifiers and keywords" {
-    const content = "def loop hello spawn";
+    const content = "def loop hello spawn receive";
     const tokens = try lex(std.testing.allocator, content);
     defer testing.allocator.free(tokens);
 
-    try testing.expect(tokens.len == 5);
+    try testing.expect(tokens.len == 6);
 
     try testing.expect(std.mem.eql(u8, tokens[0].lexeme, ""));
     try testing.expect(tokens[0].column == @as(usize, 1));
@@ -874,6 +972,11 @@ test "identifiers and keywords" {
     try testing.expect(tokens[3].column == @as(usize, 16));
     try testing.expect(tokens[3].line == @as(usize, 1));
     try testing.expect(tokens[3].tag == .keyword_spawn);
+
+    try testing.expect(std.mem.eql(u8, tokens[4].lexeme, ""));
+    try testing.expect(tokens[4].column == @as(usize, 22));
+    try testing.expect(tokens[4].line == @as(usize, 1));
+    try testing.expect(tokens[4].tag == .keyword_receive);
 }
 
 test "symbols" {
@@ -1263,4 +1366,39 @@ test "parse atom" {
     const atom_expr = expr_stmt.expression.expr;
     try testing.expect(atom_expr.* == .atom);
     try testing.expect(std.mem.eql(u8, atom_expr.atom, "atom"));
+}
+
+test "parse receive" {
+    const content = "receive { {:msg, data} -> print(data); }";
+    const tokens = try lex(std.testing.allocator, content);
+    defer testing.allocator.free(tokens);
+
+    var parser = try Parser.init(std.testing.allocator, tokens);
+    defer parser.deinit();
+
+    const stmts = try parser.parse();
+    defer {
+        for (stmts) |stmt| {
+            stmt.deinit(std.testing.allocator);
+        }
+        std.testing.allocator.free(stmts);
+    }
+
+    try testing.expectEqual(@as(usize, 1), stmts.len);
+    const receive_stmt = stmts[0];
+    try testing.expect(receive_stmt.* == .receive);
+
+    const arms = receive_stmt.receive.arms;
+    try testing.expectEqual(@as(usize, 1), arms.len);
+    const arm = arms[0];
+    try testing.expect(std.mem.eql(u8, arm.atom, "msg"));
+    try testing.expect(std.mem.eql(u8, arm.payload_name, "data"));
+    try testing.expect(arm.stmt.* == .expression);
+    const arm_expr = arm.stmt.expression.expr;
+    try testing.expect(arm_expr.* == .function_call);
+    try testing.expect(std.mem.eql(u8, arm_expr.function_call.name, "print"));
+    try testing.expectEqual(@as(usize, 1), arm_expr.function_call.args.len);
+    const arg = arm_expr.function_call.args[0];
+    try testing.expect(arg.* == .identifier);
+    try testing.expect(std.mem.eql(u8, arg.identifier, "data"));
 }
