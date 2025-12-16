@@ -113,6 +113,7 @@ pub const Program = struct {
     register_count: usize = vm.MAX_REGS,
     functions: []vm.FunctionLayout,
     atoms: [][]const u8 = &[_][]const u8{},
+    receive_tables: [][]const u16 = &[_][]const u16{},
 
     pub fn toVM(self: *const Program) vm.Program {
         return .{
@@ -121,6 +122,7 @@ pub const Program = struct {
             .register_count = self.register_count,
             .functions = self.functions,
             .atoms = self.atoms,
+            .receive_tables = self.receive_tables,
         };
     }
 
@@ -132,6 +134,10 @@ pub const Program = struct {
         alloc.free(self.strings);
         alloc.free(self.functions);
         alloc.free(self.atoms);
+        for (self.receive_tables) |tbl| {
+            alloc.free(tbl);
+        }
+        alloc.free(self.receive_tables);
     }
 };
 
@@ -151,6 +157,8 @@ pub const Assembler = struct {
     call_fixups: std.ArrayList(CallFixup),
     spawn_fixups: std.ArrayList(CallFixup),
     atom_table: AtomTable,
+    receive_tables: std.ArrayList([]const u16),
+    receive_tables_moved: bool,
 
     /// FunctionInfo contains the parsed structure of the function and the instruction where it starts
     const FunctionInfo = struct {
@@ -185,6 +193,8 @@ pub const Assembler = struct {
             .call_fixups = try std.ArrayList(CallFixup).initCapacity(alloc, 0),
             .spawn_fixups = try std.ArrayList(CallFixup).initCapacity(alloc, 0),
             .atom_table = try AtomTable.init(alloc),
+            .receive_tables = try std.ArrayList([]const u16).initCapacity(alloc, 0),
+            .receive_tables_moved = false,
         };
     }
 
@@ -207,6 +217,8 @@ pub const Assembler = struct {
             .call_fixups = try std.ArrayList(CallFixup).initCapacity(alloc, 0),
             .spawn_fixups = try std.ArrayList(CallFixup).initCapacity(alloc, 0),
             .atom_table = try AtomTable.init(alloc),
+            .receive_tables = try std.ArrayList([]const u16).initCapacity(alloc, 0),
+            .receive_tables_moved = false,
         };
     }
 
@@ -235,6 +247,13 @@ pub const Assembler = struct {
 
         self.atom_table.deinit();
 
+        if (!self.receive_tables_moved) {
+            for (self.receive_tables.items) |tbl| self.alloc.free(tbl);
+            self.receive_tables.deinit(self.alloc);
+        } else {
+            self.receive_tables.deinit(self.alloc);
+        }
+
         if (!self.instructions_moved) {
             self.instr.deinit(self.alloc);
         }
@@ -251,9 +270,12 @@ pub const Assembler = struct {
         self.atom_table.clear();
         for (self.string_pool.items) |s| self.alloc.free(@constCast(s));
         self.string_pool.clearRetainingCapacity();
+        for (self.receive_tables.items) |tbl| self.alloc.free(tbl);
+        self.receive_tables.clearRetainingCapacity();
         try self.functions.ensureTotalCapacity(4);
         self.strings_moved = false;
         self.instructions_moved = false;
+        self.receive_tables_moved = false;
 
         try self.collectFunctions();
 
@@ -285,6 +307,8 @@ pub const Assembler = struct {
         self.strings_moved = true;
         const functions = try fn_layouts.toOwnedSlice(self.alloc);
         const atoms = try self.atom_table.toOwnedSlice();
+        const receive_tables = try self.receive_tables.toOwnedSlice(self.alloc);
+        self.receive_tables_moved = true;
 
         return Program{
             .code = code,
@@ -292,6 +316,7 @@ pub const Assembler = struct {
             .register_count = @intCast(self.var_ctx.next_reg),
             .functions = functions,
             .atoms = atoms,
+            .receive_tables = receive_tables,
         };
     }
 
@@ -381,6 +406,7 @@ pub const Assembler = struct {
             .loop => try self.compileLoop(stmt),
             .ret => try self.compileReturn(stmt),
             .var_def => try self.compileVarDef(stmt),
+            .receive => try self.compileReceive(stmt),
         }
     }
 
@@ -433,6 +459,74 @@ pub const Assembler = struct {
 
             try self.instr.append(self.alloc, .{ .op = .jmp, .a = @intCast(loop_start_idx), .b = 0, .c = 0 });
         }
+    }
+
+    fn addReceiveTable(self: *Assembler, table: []const u16) AssembleError!u8 {
+        if (self.receive_tables.items.len >= std.math.maxInt(u8) + 1) {
+            return AssembleError.RegisterOverflow;
+        }
+
+        const idx: usize = self.receive_tables.items.len;
+        try self.receive_tables.append(self.alloc, table);
+        return @intCast(idx);
+    }
+
+    fn compileReceive(self: *Assembler, stmt: *parser.Statement) AssembleError!void {
+        const recv_stmt = &stmt.receive;
+
+        var arms = try std.ArrayList(struct {
+            atom_id: u16,
+            payload_reg: u8,
+            stmt: *parser.Statement,
+        }).initCapacity(self.alloc, recv_stmt.arms.len);
+        defer arms.deinit(self.alloc);
+
+        for (recv_stmt.arms) |arm| {
+            const atom_id = try self.atom_table.getOrInsert(arm.atom);
+            const payload_reg = try self.getOrCreateRegister(arm.payload_name);
+            try arms.append(self.alloc, .{
+                .atom_id = atom_id,
+                .payload_reg = payload_reg,
+                .stmt = arm.stmt,
+            });
+        }
+
+        const table_len: usize = self.atom_table.running_id;
+        var table = try self.alloc.alloc(u16, table_len);
+        errdefer self.alloc.free(table);
+        for (table) |*entry| entry.* = std.math.maxInt(u16);
+
+        const payload_reg = try self.allocateRegister();
+
+        const recv_instr_idx = self.instr.items.len;
+        try self.instr.append(self.alloc, .{ .op = .recv_match, .a = payload_reg, .b = payload_reg, .c = 0 });
+
+        var end_jumps = try std.ArrayList(usize).initCapacity(self.alloc, arms.items.len);
+        defer end_jumps.deinit(self.alloc);
+
+        for (arms.items) |meta| {
+            const arm_start = self.instr.items.len;
+            if (table[meta.atom_id] == std.math.maxInt(u16)) {
+                table[meta.atom_id] = @intCast(arm_start);
+            }
+
+            if (meta.payload_reg != payload_reg) {
+                try self.instr.append(self.alloc, .{ .op = .mov, .a = meta.payload_reg, .b = payload_reg, .c = 0 });
+            }
+
+            try self.compileStatement(meta.stmt);
+
+            try end_jumps.append(self.alloc, self.instr.items.len);
+            try self.instr.append(self.alloc, .{ .op = .jmp, .a = 0, .b = 0, .c = 0 });
+        }
+
+        const end_ip = self.instr.items.len;
+        for (end_jumps.items) |idx| {
+            self.instr.items[idx].a = @intCast(end_ip);
+        }
+
+        const table_idx = try self.addReceiveTable(table);
+        self.instr.items[recv_instr_idx].c = table_idx;
     }
 
     fn compileIfStatement(self: *Assembler, stmt: *parser.Statement) AssembleError!void {
@@ -531,11 +625,13 @@ pub const Assembler = struct {
     }
 
     fn compileSend(self: *Assembler, args: []*parser.Expr) AssembleError!u8 {
-        if (args.len != 2) return AssembleError.WrongAmountOfArguments;
+        if (args.len != 3) return AssembleError.WrongAmountOfArguments;
+        if (args[1].* != .atom) return AssembleError.UnsupportedExpression;
 
         const pid_reg = try self.compileExpr(args[0]);
-        const payload_reg = try self.compileExpr(args[1]);
-        try self.instr.append(self.alloc, .{ .op = .send, .a = pid_reg, .b = payload_reg, .c = 0 });
+        const atom_reg = try self.compileExpr(args[1]);
+        const payload_reg = try self.compileExpr(args[2]);
+        try self.instr.append(self.alloc, .{ .op = .send, .a = pid_reg, .b = atom_reg, .c = payload_reg });
         return payload_reg;
     }
 
@@ -930,7 +1026,7 @@ test "recv compiles to recv opcode" {
 }
 
 test "send compiles to send opcode" {
-    const src = "a = 1; b = 2; send(a, b);";
+    const src = "a = 1; b = 2; send(a, :ping, b);";
     const tokens = try parser.lex(testing.allocator, src);
     defer testing.allocator.free(tokens);
 
@@ -950,13 +1046,29 @@ test "send compiles to send opcode" {
     defer program.deinit(testing.allocator);
 
     const code = program.code;
-    const send_instr = code[4];
+    var send_instr: ?vm.Instr = null;
+    var send_idx: usize = 0;
+    for (code, 0..) |instr, idx| {
+        if (instr.op == vm.Op.send) {
+            send_instr = instr;
+            send_idx = idx;
+            break;
+        }
+    }
+
+    try testing.expect(send_instr != null);
+    const send = send_instr.?;
     const a_reg = assembler.registerFor("a").?;
     const b_reg = assembler.registerFor("b").?;
 
-    try testing.expectEqual(vm.Op.send, send_instr.op);
-    try testing.expectEqual(a_reg, send_instr.a);
-    try testing.expectEqual(b_reg, send_instr.b);
+    try testing.expectEqual(vm.Op.send, send.op);
+    try testing.expectEqual(a_reg, send.a);
+    try testing.expectEqual(b_reg, send.c);
+
+    // atom should be loaded right before the send
+    try testing.expect(send_idx > 0);
+    try testing.expectEqual(vm.Op.atom, code[send_idx - 1].op);
+    try testing.expectEqual(code[send_idx - 1].a, send.b);
     try testing.expectEqual(vm.Op.halt, code[code.len - 1].op);
 }
 
@@ -1069,4 +1181,43 @@ test "atom compiled correctly" {
     const atom1 = inversed.get((@as(u16, code[1].b) << 8) | @as(u16, code[1].c)).?;
     try testing.expectEqualStrings("hello", atom0);
     try testing.expectEqualStrings("world", atom1);
+}
+
+test "receive assembles to recv_match with dense table" {
+    const src =
+        \\receive { {:ping, p} -> ret p; {:pong, q} -> ret q; }
+    ;
+    const tokens = try parser.lex(testing.allocator, src);
+    defer testing.allocator.free(tokens);
+
+    var p = try parser.Parser.init(testing.allocator, tokens);
+    defer p.deinit();
+
+    const stmts = try p.parse();
+    defer {
+        for (stmts) |stmt| stmt.deinit(testing.allocator);
+        testing.allocator.free(stmts);
+    }
+
+    var assembler = try Assembler.init(testing.allocator, stmts);
+    defer assembler.deinit();
+
+    var program = try assembler.compile();
+    defer program.deinit(testing.allocator);
+
+    try testing.expect(program.receive_tables.len == 1);
+    const table = program.receive_tables[0];
+    try testing.expect(table.len >= 2);
+
+    const invalid = std.math.maxInt(u16);
+    try testing.expect(table[0] != invalid);
+    try testing.expect(table[1] != invalid);
+
+    const code = program.code;
+    try testing.expectEqual(vm.Op.recv_match, code[0].op);
+    try testing.expectEqual(@as(u8, 0), code[0].c); // receive table index
+
+    // atom order should map :ping -> 0, :pong -> 1
+    try testing.expectEqualStrings("ping", program.atoms[0]);
+    try testing.expectEqualStrings("pong", program.atoms[1]);
 }

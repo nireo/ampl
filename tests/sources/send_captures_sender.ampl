@@ -6,4 +6,4 @@ def logger() {
 
 child = spawn(logger);
 parent = self();
-send(child, 9);
+send(child, :msg, 9);

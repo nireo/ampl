@@ -60,6 +60,7 @@ pub const Program = struct {
     register_count: usize = MAX_REGS,
     functions: []const FunctionLayout = &[_]FunctionLayout{},
     atoms: []const []const u8 = &[_][]const u8{},
+    receive_tables: []const []const u16 = &[_][]const u16{},
 
     /// registerCountFor returns the register count for a function starting at the
     /// provided instruction pointer.
@@ -184,6 +185,7 @@ pub const Heap = struct {
 
 const Message = struct {
     sender: usize,
+    atom: u16,
     payload: Value,
 };
 
@@ -204,6 +206,7 @@ pub const Op = enum(u8) {
     sub,
     spawn,
     send,
+    recv_match,
     jmp,
     call,
     ret,
@@ -427,8 +430,9 @@ pub const VM = struct {
             },
             .send => {
                 const to_pid = try expectPid(proc.regs[instr.a]);
-                const payload = proc.regs[instr.b];
-                try vm.sendMessage(proc.id, to_pid, payload);
+                const atom = try expectAtom(proc.regs[instr.b]);
+                const payload = proc.regs[instr.c];
+                try vm.sendMessage(proc.id, to_pid, atom, payload);
                 proc.ip += 1;
             },
             .eq => {
@@ -497,6 +501,40 @@ pub const VM = struct {
                     proc.regs[instr.b] = Value{ .pid = msg.sender };
                 }
                 proc.ip += 1;
+            },
+            .recv_match => {
+                const table_idx: usize = instr.c;
+                if (table_idx >= proc.program.receive_tables.len) return error.InvalidReceiveTable;
+                const table = proc.program.receive_tables[table_idx];
+
+                var match_idx: ?usize = null;
+                var matched_atom: u16 = 0;
+
+                for (proc.mailbox.items, 0..) |msg, idx| {
+                    if (msg.atom < table.len) {
+                        const target_ip = table[msg.atom];
+                        if (target_ip != std.math.maxInt(u16)) {
+                            match_idx = idx;
+                            matched_atom = msg.atom;
+                            break;
+                        }
+                    }
+                }
+
+                if (match_idx == null) {
+                    proc.status = .waiting;
+                    return;
+                }
+
+                const msg = proc.mailbox.orderedRemove(match_idx.?);
+                proc.regs[instr.a] = msg.payload;
+                if (instr.b != instr.a) {
+                    proc.regs[instr.b] = Value{ .pid = msg.sender };
+                }
+
+                const target_ip = table[matched_atom];
+                if (target_ip == std.math.maxInt(u16)) return error.InvalidReceiveTarget;
+                proc.ip = target_ip;
             },
             .jmp => {
                 proc.ip = instr.a;
@@ -585,7 +623,7 @@ pub const VM = struct {
     }
 
     // sendMessage sends a given value into the mailbox of another process.
-    fn sendMessage(vm: *VM, from_pid: usize, to_pid: usize, msg: Value) !void {
+    fn sendMessage(vm: *VM, from_pid: usize, to_pid: usize, atom: u16, msg: Value) !void {
         if (to_pid >= vm.processes.items.len) return error.NoSuchPid;
         const maybe_proc = &vm.processes.items[to_pid];
         if (maybe_proc.* == null) return error.NoSuchPid;
@@ -593,6 +631,7 @@ pub const VM = struct {
         if (maybe_proc.*) |*proc| {
             try proc.mailbox.append(vm.allocator, Message{
                 .sender = from_pid,
+                .atom = atom,
                 .payload = msg,
             });
 
@@ -667,6 +706,13 @@ fn expectInt(v: Value) !i64 {
 fn expectPid(v: Value) !usize {
     return switch (v) {
         .pid => |pid| pid,
+        else => error.TypeMismatch,
+    };
+}
+
+fn expectAtom(v: Value) !u16 {
+    return switch (v) {
+        .atom => |id| id,
         else => error.TypeMismatch,
     };
 }
@@ -860,12 +906,15 @@ test "send wakes waiting receiver" {
         .{ .op = .halt, .a = 0, .b = 0, .c = 0 },
     };
     const send_code = [_]Instr{
-        .{ .op = .send, .a = 0, .b = 1, .c = 0 },
+        .{ .op = .atom, .a = 2, .b = 0, .c = 0 },
+        .{ .op = .send, .a = 0, .b = 2, .c = 1 },
         .{ .op = .halt, .a = 0, .b = 0, .c = 0 },
     };
 
-    const recv_program = Program{ .code = &recv_code, .strings = &[_][]const u8{} };
-    const send_program = Program{ .code = &send_code, .strings = &[_][]const u8{} };
+    const atoms = &[_][]const u8{"msg"};
+
+    const recv_program = Program{ .code = &recv_code, .strings = &[_][]const u8{}, .atoms = atoms };
+    const send_program = Program{ .code = &send_code, .strings = &[_][]const u8{}, .atoms = atoms };
     const recv_pid = try vm.spawn(recv_program, 0);
     const send_pid = try vm.spawn(send_program, 0);
 
@@ -891,12 +940,14 @@ test "recv captures sender when requested" {
         .{ .op = .halt, .a = 0, .b = 0, .c = 0 },
     };
     const send_code = [_]Instr{
-        .{ .op = .send, .a = 0, .b = 1, .c = 0 },
+        .{ .op = .atom, .a = 2, .b = 0, .c = 0 },
+        .{ .op = .send, .a = 0, .b = 2, .c = 1 },
         .{ .op = .halt, .a = 0, .b = 0, .c = 0 },
     };
 
-    const recv_program = Program{ .code = &recv_code, .strings = &[_][]const u8{} };
-    const send_program = Program{ .code = &send_code, .strings = &[_][]const u8{} };
+    const atoms = &[_][]const u8{"msg"};
+    const recv_program = Program{ .code = &recv_code, .strings = &[_][]const u8{}, .atoms = atoms };
+    const send_program = Program{ .code = &send_code, .strings = &[_][]const u8{}, .atoms = atoms };
     const recv_pid = try vm.spawn(recv_program, 0);
     const send_pid = try vm.spawn(send_program, 0);
 
@@ -909,6 +960,88 @@ test "recv captures sender when requested" {
     const receiver = vm.processes.items[recv_pid].?;
     try std.testing.expectEqual(@as(i64, 42), try expectInt(receiver.regs[0]));
     try std.testing.expectEqual(send_pid, try expectPid(receiver.regs[1]));
+}
+
+test "recv_match waits for matching atom and keeps unmatched messages" {
+    const gpa = std.testing.allocator;
+    var vm = try VM.init(gpa);
+    defer vm.deinit();
+
+    const code = [_]Instr{
+        .{ .op = .recv_match, .a = 0, .b = 1, .c = 0 }, // payload -> r0, sender -> r1
+        .{ .op = .mov, .a = 2, .b = 0, .c = 0 }, // store payload for assertion
+        .{ .op = .halt, .a = 0, .b = 0, .c = 0 },
+    };
+
+    const invalid = std.math.maxInt(u16);
+    const table0 = [_]u16{ invalid, 1 }; // only atom id 1 matches, jumps to mov
+    const recv_tables = &[_][]const u16{ table0[0..] };
+    const atoms = &[_][]const u8{ "foo", "bar" };
+
+    const program = Program{
+        .code = &code,
+        .strings = &[_][]const u8{},
+        .receive_tables = recv_tables,
+        .atoms = atoms,
+    };
+
+    const pid = try vm.spawn(program, 0);
+
+    try vm.run();
+    try std.testing.expectEqual(@as(ProcessStatus, .waiting), vm.processes.items[pid].?.status);
+
+    try vm.sendMessage(0, pid, 0, Value{ .int = 7 }); // unmatched :foo
+    try vm.run();
+    try std.testing.expectEqual(@as(ProcessStatus, .waiting), vm.processes.items[pid].?.status);
+
+    try vm.sendMessage(0, pid, 1, Value{ .int = 3 }); // matching :bar
+    try vm.run();
+
+    const proc = vm.processes.items[pid].?;
+    try std.testing.expectEqual(@as(ProcessStatus, .dead), proc.status);
+    try std.testing.expectEqual(@as(i64, 3), try expectInt(proc.regs[2]));
+    try std.testing.expectEqual(@as(usize, 1), proc.mailbox.items.len); // unmatched stayed queued
+    try std.testing.expectEqual(@as(u16, 0), proc.mailbox.items[0].atom);
+}
+
+test "recv_match dispatches by atom" {
+    const gpa = std.testing.allocator;
+    var vm = try VM.init(gpa);
+    defer vm.deinit();
+
+    const code = [_]Instr{
+        .{ .op = .recv_match, .a = 2, .b = 3, .c = 0 }, // payload -> r2
+        // :ping arm
+        .{ .op = .mov, .a = 0, .b = 2, .c = 0 },
+        .{ .op = .ret, .a = 0, .b = 0, .c = 0 },
+        // :pong arm
+        .{ .op = .mov, .a = 0, .b = 2, .c = 0 },
+        .{ .op = .imm, .a = 1, .b = 10, .c = 0 },
+        .{ .op = .add, .a = 0, .b = 0, .c = 1 },
+        .{ .op = .ret, .a = 0, .b = 0, .c = 0 },
+    };
+
+    const table0 = [_]u16{ 1, 3 };
+    const recv_tables = &[_][]const u16{ table0[0..] };
+    const atoms = &[_][]const u8{ "ping", "pong" };
+
+    const program = Program{
+        .code = &code,
+        .strings = &[_][]const u8{},
+        .receive_tables = recv_tables,
+        .atoms = atoms,
+    };
+
+    const pid = try vm.spawn(program, 0);
+
+    try vm.sendMessage(0, pid, 99, Value{ .int = 7 }); // unmatched
+    try vm.sendMessage(0, pid, 1, Value{ .int = 5 }); // :pong matches second arm
+
+    try vm.run();
+
+    const proc = vm.processes.items[pid].?;
+    try std.testing.expectEqual(@as(ProcessStatus, .dead), proc.status);
+    try std.testing.expectEqual(@as(i64, 15), try expectInt(proc.regs[0]));
 }
 
 test "atom instruction produces atom values" {
@@ -1029,7 +1162,7 @@ test "strings in mailboxes survive collection" {
         proc.regs[0] = Value{ .unit = {} };
     }
 
-    try vm.sendMessage(0, pid, msg);
+    try vm.sendMessage(0, pid, 0, msg);
     try std.testing.expectEqual(@as(usize, 1), vm.liveStrings());
 
     vm.collect();

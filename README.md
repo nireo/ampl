@@ -10,13 +10,13 @@ This is some syntax I had in mind.
 def pong() {
     loop {
         let msg = recv();
-        send(msg.sender, msg.value + 1);
+        send(msg.sender, :pong, msg.value + 1);
     }
 }
 
 let p = spawn { pong() };
 
-send(p, { sender: self, value: 0 });
+send(p, :ping, { sender: self, value: 0 });
 
 let reply = recv();
 print(reply.value);  # 1
