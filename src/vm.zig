@@ -363,6 +363,7 @@ pub const VM = struct {
     /// reductions (instruction budget) before re-enqueuing it. Waiting processes
     /// remain parked until a message arrives.
     pub fn run(vm: *VM) !void {
+        std.debug.print("hehehehe", .{});
         while (vm.popNext()) |pid| {
             const maybe_proc = &vm.processes.items[pid];
             if (maybe_proc.*) |*proc| {
@@ -975,7 +976,7 @@ test "recv_match waits for matching atom and keeps unmatched messages" {
 
     const invalid = std.math.maxInt(u16);
     const table0 = [_]u16{ invalid, 1 }; // only atom id 1 matches, jumps to mov
-    const recv_tables = &[_][]const u16{ table0[0..] };
+    const recv_tables = &[_][]const u16{table0[0..]};
     const atoms = &[_][]const u8{ "foo", "bar" };
 
     const program = Program{
@@ -1022,7 +1023,7 @@ test "recv_match dispatches by atom" {
     };
 
     const table0 = [_]u16{ 1, 3 };
-    const recv_tables = &[_][]const u16{ table0[0..] };
+    const recv_tables = &[_][]const u16{table0[0..]};
     const atoms = &[_][]const u8{ "ping", "pong" };
 
     const program = Program{

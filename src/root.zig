@@ -13,6 +13,7 @@ pub fn bufferedPrint() !void {
     try stdout.print("Run `zig build test` to run the tests.\n", .{});
 
     try stdout.flush(); // Don't forget to flush!
+
 }
 
 pub fn add(a: i32, b: i32) i32 {

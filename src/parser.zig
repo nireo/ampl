@@ -11,7 +11,7 @@ pub const ParserError = error{
     PrecendenceError,
 };
 
-pub const ParseError = ParserError || std.mem.Allocator.Error;
+pub const ParseError = ParserError || std.mem.Allocator.Error || std.fmt.ParseIntError;
 
 pub const TokenTag = enum {
     identifier,
@@ -79,6 +79,7 @@ const keywords = std.StaticStringMap(TokenTag).initComptime(.{
     .{ "if", TokenTag.keyword_if },
     .{ "else", TokenTag.keyword_else },
     .{ "receive", TokenTag.keyword_receive },
+    .{ "after", TokenTag.keyword_after },
 });
 
 pub fn lex(alloc: std.mem.Allocator, source: []const u8) ![]Token {
@@ -421,6 +422,8 @@ pub const Statement = union(StatementTag) {
     },
     receive: struct {
         arms: []ReceiveArm,
+        after_timeout: ?u32,
+        after_body: ?*Statement,
     },
 
     pub fn deinit(self: *Statement, alloc: std.mem.Allocator) void {
@@ -466,6 +469,11 @@ pub const Statement = union(StatementTag) {
                 for (self.receive.arms) |arm| {
                     arm.stmt.deinit(alloc);
                 }
+
+                if (self.receive.after_body) |stmt| {
+                    stmt.deinit(alloc);
+                }
+
                 alloc.free(self.receive.arms);
             },
         }
@@ -527,6 +535,15 @@ pub const Statement = union(StatementTag) {
                     }
                     try writer.print("arm: :{s}, {s}\n", .{ arm.atom, arm.payload_name });
                     try arm.stmt.dump(writer, indent + 2);
+                }
+
+                if (self.receive.after_body) |stmt| {
+                    for (0..indent + 1) |_| {
+                        try writer.print("  ", .{});
+                    }
+
+                    try writer.print("after: {d}\n", .{self.receive.after_timeout.?});
+                    try stmt.dump(writer, indent + 2);
                 }
             },
         }
@@ -689,41 +706,55 @@ pub const Parser = struct {
         try self.expect(.l_brace);
         while (self.peek().tag != .r_brace) {
             const tok = self.advance();
-            switch (tok.tag) {
-                .l_brace => {
-                    // {:something, info} -> print(info),
-                    const atom = try self.matchRet(.atom);
-                    try self.expect(.comma);
+            if (tok.tag == .l_brace) {
+                // {:something, info} -> print(info),
+                const atom = try self.matchRet(.atom);
+                try self.expect(.comma);
 
-                    const payload = try self.matchRet(.identifier);
-                    try self.expect(.r_brace);
-                    try self.expect(.arrow);
+                const payload = try self.matchRet(.identifier);
+                try self.expect(.r_brace);
+                try self.expect(.arrow);
 
-                    const stmt_body = try self.parseStatement();
-                    errdefer stmt_body.deinit(self.alloc);
-                    _ = self.match(.comma);
+                const stmt_body = try self.parseStatement();
+                errdefer stmt_body.deinit(self.alloc);
+                _ = self.match(.comma);
 
-                    try arms.append(self.alloc, ReceiveArm{
-                        .atom = atom.lexeme,
-                        .payload_name = payload.lexeme,
-                        .stmt = stmt_body,
-                    });
-                },
-                else => {
-                    return ParseError.InvalidTokenStmt;
-                },
+                try arms.append(self.alloc, ReceiveArm{
+                    .atom = atom.lexeme,
+                    .payload_name = payload.lexeme,
+                    .stmt = stmt_body,
+                });
+            } else {
+                return ParseError.InvalidTokenStmt;
             }
         }
 
         try self.expect(.r_brace);
+
         const stmt = try self.alloc.create(Statement);
         errdefer self.alloc.destroy(stmt);
 
         stmt.* = .{
             .receive = .{
                 .arms = try arms.toOwnedSlice(self.alloc),
+                .after_body = null,
+                .after_timeout = null,
             },
         };
+
+        // check if there is a timeout present, this is optional
+        if (self.match(.keyword_after)) {
+            const timeout_amount = try self.matchRet(.number);
+            const parsed = try std.fmt.parseInt(u32, timeout_amount.lexeme, 10);
+
+            try self.expect(.arrow);
+
+            const after_body = try self.parseStatement();
+
+            stmt.receive.after_body = after_body;
+            stmt.receive.after_timeout = parsed;
+        }
+
         return stmt;
     }
 
@@ -1369,7 +1400,7 @@ test "parse atom" {
 }
 
 test "parse receive" {
-    const content = "receive { {:msg, data} -> print(data); }";
+    const content = "receive { {:msg, data} -> print(data); } after 1000 -> print(data);";
     const tokens = try lex(std.testing.allocator, content);
     defer testing.allocator.free(tokens);
 
@@ -1401,4 +1432,10 @@ test "parse receive" {
     const arg = arm_expr.function_call.args[0];
     try testing.expect(arg.* == .identifier);
     try testing.expect(std.mem.eql(u8, arg.identifier, "data"));
+
+    try testing.expectEqual(receive_stmt.receive.after_timeout.?, @as(u32, 1000));
+    const after_expr = receive_stmt.receive.after_body.?.expression.expr;
+    try testing.expect(after_expr.* == .function_call);
+    try testing.expect(std.mem.eql(u8, after_expr.function_call.name, "print"));
+    try testing.expectEqual(@as(usize, 1), after_expr.function_call.args.len);
 }
