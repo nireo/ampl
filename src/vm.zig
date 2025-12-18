@@ -207,6 +207,7 @@ pub const Op = enum(u8) {
     spawn,
     send,
     recv_match,
+    recv_match_after,
     jmp,
     call,
     ret,
@@ -273,6 +274,8 @@ const Process = struct {
     mailbox: std.ArrayList(Message),
     frames: std.ArrayList(Frame),
     status: ProcessStatus,
+    recv_deadline_ms: ?i64,
+    recv_timeout_table_idx: ?u8,
 };
 
 pub const VM = struct {
@@ -346,6 +349,8 @@ pub const VM = struct {
             .mailbox = mailbox,
             .frames = std.ArrayList(Frame).empty,
             .status = .ready,
+            .recv_deadline_ms = null,
+            .recv_timeout_table_idx = null,
         };
 
         vm.processes.items[pid] = proc;
@@ -359,12 +364,64 @@ pub const VM = struct {
         return vm.run_queue.orderedRemove(0);
     }
 
+    fn nextTimeout(vm: *VM) ?i64 {
+        var next: ?i64 = null;
+        for (vm.processes.items) |maybe_proc| {
+            if (maybe_proc) |proc| {
+                if (proc.recv_deadline_ms) |deadline| {
+                    if (next == null or deadline < next.?) {
+                        next = deadline;
+                    }
+                }
+            }
+        }
+        return next;
+    }
+
+    fn wakeTimedOut(vm: *VM) !void {
+        const now = std.time.milliTimestamp();
+        for (vm.processes.items, 0..) |*maybe_proc, pid| {
+            if (maybe_proc.*) |*proc| {
+                if (proc.status != .waiting) continue;
+                if (proc.recv_deadline_ms) |deadline| {
+                    if (now < deadline) continue;
+
+                    const table_idx = proc.recv_timeout_table_idx orelse return error.InvalidReceiveTable;
+                    if (table_idx >= proc.program.receive_tables.len) return error.InvalidReceiveTable;
+                    const table = proc.program.receive_tables[table_idx];
+                    if (table.len == 0) return error.InvalidReceiveTable;
+                    const timeout_ip = table[table.len - 1];
+                    if (timeout_ip == std.math.maxInt(u16)) return error.InvalidReceiveTarget;
+
+                    proc.ip = timeout_ip;
+                    proc.status = .ready;
+                    proc.recv_deadline_ms = null;
+                    proc.recv_timeout_table_idx = null;
+                    try vm.run_queue.append(vm.allocator, pid);
+                }
+            }
+        }
+    }
+
     /// run loops through the processes and gives each ready process a slice of
     /// reductions (instruction budget) before re-enqueuing it. Waiting processes
     /// remain parked until a message arrives.
     pub fn run(vm: *VM) !void {
-        std.debug.print("hehehehe", .{});
-        while (vm.popNext()) |pid| {
+        while (true) {
+            try vm.wakeTimedOut();
+            if (vm.run_queue.items.len == 0) {
+                const next_deadline = vm.nextTimeout();
+                if (next_deadline == null) break;
+
+                const now = std.time.milliTimestamp();
+                if (next_deadline.? > now) {
+                    const delta_ms = @as(u64, @intCast(next_deadline.? - now));
+                    std.Thread.sleep(delta_ms * std.time.ns_per_ms);
+                }
+                continue;
+            }
+
+            const pid = vm.popNext().?;
             const maybe_proc = &vm.processes.items[pid];
             if (maybe_proc.*) |*proc| {
                 if (proc.status != .ready) continue; // skip waiting/dead
@@ -532,6 +589,50 @@ pub const VM = struct {
                 if (instr.b != instr.a) {
                     proc.regs[instr.b] = Value{ .pid = msg.sender };
                 }
+
+                const target_ip = table[matched_atom];
+                if (target_ip == std.math.maxInt(u16)) return error.InvalidReceiveTarget;
+                proc.ip = target_ip;
+            },
+            .recv_match_after => {
+                const table_idx: usize = instr.c;
+                if (table_idx >= proc.program.receive_tables.len) return error.InvalidReceiveTable;
+                const table = proc.program.receive_tables[table_idx];
+                if (table.len == 0) return error.InvalidReceiveTable;
+
+                var match_idx: ?usize = null;
+                var matched_atom: u16 = 0;
+
+                for (proc.mailbox.items, 0..) |msg, idx| {
+                    if (msg.atom < table.len) {
+                        const target_ip = table[msg.atom];
+                        if (target_ip != std.math.maxInt(u16)) {
+                            match_idx = idx;
+                            matched_atom = msg.atom;
+                            break;
+                        }
+                    }
+                }
+
+                if (match_idx == null) {
+                    if (instr.b == 0) {
+                        const timeout_ip = table[table.len - 1];
+                        if (timeout_ip == std.math.maxInt(u16)) return error.InvalidReceiveTarget;
+                        proc.ip = timeout_ip;
+                        proc.recv_deadline_ms = null;
+                        proc.recv_timeout_table_idx = null;
+                    } else {
+                        proc.status = .waiting;
+                        proc.recv_deadline_ms = std.time.milliTimestamp() + instr.b;
+                        proc.recv_timeout_table_idx = instr.c;
+                    }
+                    return;
+                }
+
+                const msg = proc.mailbox.orderedRemove(match_idx.?);
+                proc.regs[instr.a] = msg.payload;
+                proc.recv_deadline_ms = null;
+                proc.recv_timeout_table_idx = null;
 
                 const target_ip = table[matched_atom];
                 if (target_ip == std.math.maxInt(u16)) return error.InvalidReceiveTarget;

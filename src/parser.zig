@@ -649,6 +649,7 @@ pub const Parser = struct {
             },
             .identifier, .keyword_spawn => {
                 _ = self.advance();
+                const name = if (tok.tag == .keyword_spawn) "spawn" else tok.lexeme;
                 if (self.peek().tag == .l_paren) {
                     _ = self.advance(); // consume '('
                     var args = try std.ArrayList(*Expr).initCapacity(self.alloc, 0);
@@ -670,7 +671,7 @@ pub const Parser = struct {
                     const expr = try self.alloc.create(Expr);
                     expr.* = .{
                         .function_call = .{
-                            .name = tok.lexeme,
+                            .name = name,
                             .args = try args.toOwnedSlice(self.alloc),
                         },
                     };

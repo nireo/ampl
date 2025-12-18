@@ -491,7 +491,8 @@ pub const Assembler = struct {
             });
         }
 
-        const table_len: usize = self.atom_table.running_id;
+        const has_after = recv_stmt.after_body != null;
+        const table_len: usize = self.atom_table.running_id + (if (has_after) @as(usize, 1) else 0);
         var table = try self.alloc.alloc(u16, table_len);
         errdefer self.alloc.free(table);
         for (table) |*entry| entry.* = std.math.maxInt(u16);
@@ -499,9 +500,16 @@ pub const Assembler = struct {
         const payload_reg = try self.allocateRegister();
 
         const recv_instr_idx = self.instr.items.len;
-        try self.instr.append(self.alloc, .{ .op = .recv_match, .a = payload_reg, .b = payload_reg, .c = 0 });
+        if (has_after) {
+            const timeout = recv_stmt.after_timeout orelse 0;
+            if (timeout > std.math.maxInt(u8)) return AssembleError.NumberOutOfRange;
+            try self.instr.append(self.alloc, .{ .op = .recv_match_after, .a = payload_reg, .b = @intCast(timeout), .c = 0 });
+        } else {
+            try self.instr.append(self.alloc, .{ .op = .recv_match, .a = payload_reg, .b = payload_reg, .c = 0 });
+        }
 
-        var end_jumps = try std.ArrayList(usize).initCapacity(self.alloc, arms.items.len);
+        const end_jump_count: usize = arms.items.len + (if (has_after) @as(usize, 1) else 0);
+        var end_jumps = try std.ArrayList(usize).initCapacity(self.alloc, end_jump_count);
         defer end_jumps.deinit(self.alloc);
 
         for (arms.items) |meta| {
@@ -515,6 +523,17 @@ pub const Assembler = struct {
             }
 
             try self.compileStatement(meta.stmt);
+
+            try end_jumps.append(self.alloc, self.instr.items.len);
+            try self.instr.append(self.alloc, .{ .op = .jmp, .a = 0, .b = 0, .c = 0 });
+        }
+
+        if (has_after) {
+            const after_body = recv_stmt.after_body.?;
+            const after_start = self.instr.items.len;
+            table[table.len - 1] = @intCast(after_start);
+
+            try self.compileStatement(after_body);
 
             try end_jumps.append(self.alloc, self.instr.items.len);
             try self.instr.append(self.alloc, .{ .op = .jmp, .a = 0, .b = 0, .c = 0 });
